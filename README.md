@@ -1,92 +1,57 @@
-# gsplat
+# Panoramic Gaussian Splatting (yzslab/gsplat - Older Version)
 
-[![Core Tests.](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/core_tests.yml)
-[![Docs](https://github.com/nerfstudio-project/gsplat/actions/workflows/doc.yml/badge.svg?branch=main)](https://github.com/nerfstudio-project/gsplat/actions/workflows/doc.yml)
+This project extends the older `yzslab/gsplat` library to support panoramic (omni-directional) image rendering using 3D Gaussian Splatting.
 
-[http://www.gsplat.studio/](http://www.gsplat.studio/)
+## What's New
 
-gsplat is an open-source library for CUDA accelerated rasterization of gaussians with python bindings. It is inspired by the SIGGRAPH paper [3D Gaussian Splatting for Real-Time Rendering of Radiance Fields](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/), but we’ve made gsplat even faster, more memory efficient, and with a growing list of new features! 
+Panoramic rendering capabilities have been added to this version of the `gsplat` library. This allows for rendering 3D Gaussian Splatting scenes from panoramic camera perspectives.
 
-<div align="center">
-  <video src="https://github.com/nerfstudio-project/gsplat/assets/10151885/64c2e9ca-a9a6-4c7e-8d6f-47eeacd15159" width="100%" />
-</div>
+## Implementation Details
 
-## Installation
+The following key changes were made to integrate panoramic rendering into this older codebase:
 
-**Dependence**: Please install [Pytorch](https://pytorch.org/get-started/locally/) first.
+- A `PANORAMA` camera model type was added to `yzslab/gsplat/gsplat/cuda/include/bindings.h`.
+- Panoramic projection and its backward pass (`panorama_proj` and `panorama_proj_vjp`) were implemented in `yzslab/gsplat/gsplat/cuda/include/proj.cuh`, based on the logic from the `op43dgs` repository.
+- The CUDA kernels for basic projection (`proj_fwd.cu`, `proj_bwd.cu`), fused projection (`fully_fused_projection_fwd.cu`, `fully_fused_projection_bwd.cu`), and packed fused projection (`fully_fused_projection_packed_fwd.cu`, `fully_fused_projection_packed_bwd.cu`) were modified to include a case for the `PANORAMA` camera model, calling the new panoramic projection functions.
+- The Python wrapper file `yzslab/gsplat/gsplat/cuda/_wrapper.py` was updated to include "panorama" in the type hints for relevant projection functions.
+- The C++ bindings in `yzslab/gsplat/gsplat/cuda/csrc/ext.cpp` were updated to expose the new `PANORAMA` camera model type.
 
-The easiest way is to install from PyPI. In this way it will build the CUDA code **on the first run** (JIT).
+## How to Use
 
-```bash
-pip install gsplat
+To use the panoramic rendering feature, you will need to specify the `camera_model` parameter as `"panorama"` when calling the relevant projection functions in this version of the `gsplat` library.
+
+For example, when using the `fully_fused_projection` function, you would pass `camera_model="panorama"`:
+
+```python
+import torch
+from gsplat.cuda import fully_fused_projection # Assuming this is the correct import path for this version
+
+# Assuming you have your means, quats, scales, viewmats, and Ks tensors ready
+# ...
+
+# Perform panoramic projection
+# Note: The exact function signature might differ slightly in this older version.
+# Refer to the source code or original documentation if needed.
+radii, means2d, depths, conics, compensations = fully_fused_projection(
+    means=means,
+    quats=quats,
+    scales=scales,
+    viewmats=viewmats,
+    Ks=Ks,
+    width=image_width,
+    height=image_height,
+    camera_model="panorama", # Specify the panoramic camera model
+    # Other parameters specific to this version...
+)
+
+# Continue with rasterization using the projected data
+# ...
 ```
 
-Alternatively you can install gsplat from source. In this way it will build the CUDA code during installation.
+You would similarly specify `camera_model="panorama"` when using other projection functions that support the `CameraModelType` parameter in this version.
 
-```bash
-pip install git+https://github.com/nerfstudio-project/gsplat.git
-```
+Please refer to the original documentation or source code of this specific `yzslab/gsplat` version for detailed usage of other functions and parameters.
 
-We also provide [pre-compiled wheels](https://docs.gsplat.studio/whl) for both linux and windows on certain python-torch-CUDA combinations (please check first which versions are supported). Note this way you would have to manually install [gsplat's dependencies](https://github.com/nerfstudio-project/gsplat/blob/6022cf45a19ee307803aaf1f19d407befad2a033/setup.py#L115). For example, to install gsplat for pytorch 2.0 and cuda 11.8 you can run
-```
-pip install ninja numpy jaxtyping rich
-pip install gsplat --index-url https://docs.gsplat.studio/whl/pt20cu118
-```
+## Building
 
-To build gsplat from source on Windows, please check [this instruction](docs/INSTALL_WIN.md).
-
-## Evaluation
-
-This repo comes with a standalone script that reproduces the official Gaussian Splatting with exactly the same performance on PSNR, SSIM, LPIPS, and converged number of Gaussians. Powered by gsplat’s efficient CUDA implementation, the training takes up to **4x less GPU memory** with up to **15% less time** to finish than the official implementation. Full report can be found [here](https://docs.gsplat.studio/main/tests/eval.html).
-
-```bash
-cd examples
-pip install -r requirements.txt
-# download mipnerf_360 benchmark data
-python datasets/download_dataset.py
-# run batch evaluation
-bash benchmarks/basic.sh
-```
-
-## Examples
-
-We provide a set of examples to get you started! Below you can find the details about
-the examples (requires to install some exta dependencies via `pip install -r examples/requirements.txt`)
-
-- [Train a 3D Gaussian splatting model on a COLMAP capture.](https://docs.gsplat.studio/main/examples/colmap.html)
-- [Fit a 2D image with 3D Gaussians.](https://docs.gsplat.studio/main/examples/image.html)
-- [Render a large scene in real-time.](https://docs.gsplat.studio/main/examples/large_scale.html)
-
-
-## Development and Contribution
-
-This repository was born from the curiosity of people on the Nerfstudio team trying to understand a new rendering technique. We welcome contributions of any kind and are open to feedback, bug-reports, and improvements to help expand the capabilities of this software.
-
-This project is developed by the following wonderful contributors (unordered):
-
-- [Angjoo Kanazawa](https://people.eecs.berkeley.edu/~kanazawa/) (UC Berkeley): Mentor of the project.
-- [Matthew Tancik](https://www.matthewtancik.com/about-me) (Luma AI): Mentor of the project.
-- [Vickie Ye](https://people.eecs.berkeley.edu/~vye/) (UC Berkeley): Project lead. v0.1 lead.
-- [Matias Turkulainen](https://maturk.github.io/) (Aalto University): Core developer.
-- [Ruilong Li](https://www.liruilong.cn/) (UC Berkeley): Core developer. v1.0 lead.
-- [Justin Kerr](https://kerrj.github.io/) (UC Berkeley): Core developer.
-- [Brent Yi](https://github.com/brentyi) (UC Berkeley): Core developer.
-- [Zhuoyang Pan](https://panzhy.com/) (ShanghaiTech University): Core developer.
-- [Jianbo Ye](http://www.jianboye.org/) (Amazon): Core developer.
-
-We also have a white paper with about the project with benchmarking and mathematical supplement with conventions and derivations, available [here](https://arxiv.org/abs/2409.06765). If you find this library useful in your projects or papers, please consider citing:
-
-```
-@article{ye2024gsplatopensourcelibrarygaussian,
-    title={gsplat: An Open-Source Library for {Gaussian} Splatting}, 
-    author={Vickie Ye and Ruilong Li and Justin Kerr and Matias Turkulainen and Brent Yi and Zhuoyang Pan and Otto Seiskari and Jianbo Ye and Jeffrey Hu and Matthew Tancik and Angjoo Kanazawa},
-    year={2024},
-    eprint={2409.06765},
-    journal={arXiv preprint arXiv:2409.06765},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2409.06765}, 
-}
-```
-
-We welcome contributions of any kind and are open to feedback, bug-reports, and improvements to help expand the capabilities of this software. Please check [docs/DEV.md](docs/DEV.md) for more info about development.
+After applying these changes, you will need to rebuild this specific `yzslab/gsplat` library to include the new CUDA code. Follow the standard build instructions provided with this version, which typically involve using CMake and Python's `setuptools`.

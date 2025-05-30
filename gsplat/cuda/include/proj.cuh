@@ -2,6 +2,7 @@
 #define GSPLAT_CUDA_PROJ_CUH
 
 #include "types.cuh"
+#define M_PI 3.14159265358979323846
 
 namespace gsplat {
 
@@ -340,6 +341,90 @@ inline __device__ void fisheye_proj_vjp(
     v_mean3d.x += dL_dtx_raw;
     v_mean3d.y += dL_dty_raw;
     v_mean3d.z += dL_dtz_raw;
+}
+
+template <typename T>
+inline __device__ void panorama_proj(
+    // inputs
+    const vec3<T> mean3d,
+    const mat3<T> cov3d,
+    const T fx,
+    const T fy,
+    const T cx,
+    const T cy,
+    const uint32_t width,
+    const uint32_t height,
+    // outputs
+    mat2<T> &cov2d,
+    vec2<T> &mean2d
+) {
+    T x = mean3d[0], y = mean3d[1], z = mean3d[2];
+    T r = sqrt(x * x + y * y + z * z);
+
+    T xz_norm = sqrt(x * x + z * z + 1e-8f);
+
+    T longitude = atan2(x, z);
+    T latitude = asin(y / r);
+
+    T normalized_latitude = latitude / (M_PI / 2.0);
+    T normalized_longitude = longitude / M_PI;
+
+    mean2d = vec2<T>((normalized_longitude + 1) * width / 2, (normalized_latitude + 1) * height / 2);
+
+    T denom_xz = x * x + z * z + 1e-8f;
+    T denom_r2 = r * r + 1e-8f;
+    // mat3x2 is 3 columns x 2 rows.
+    mat3x2<T> J = mat3x2<T>(
+        width / (2 * M_PI) * (z / denom_xz),
+        height / M_PI * (- (x * y) / (denom_r2 * xz_norm)), // 1st column
+        0.f,
+        height / M_PI * (xz_norm / denom_r2), // 2nd column
+        width / (2 * M_PI) * (-x / denom_xz),
+        height / M_PI * (- (z * y) / (denom_r2 * xz_norm)) // 3rd column
+    );
+
+    cov2d = J * cov3d * glm::transpose(J);
+}
+
+template <typename T>
+inline __device__ void panorama_proj_vjp(
+    // fwd inputs
+    const vec3<T> mean3d,
+    const mat3<T> cov3d,
+    const T fx,
+    const T fy,
+    const T cx,
+    const T cy,
+    const uint32_t width,
+    const uint32_t height,
+    // grad outputs
+    const mat2<T> v_cov2d,
+    const vec2<T> v_mean2d,
+    // grad inputs
+    vec3<T> &v_mean3d,
+    mat3<T> &v_cov3d
+) {
+    T x = mean3d[0];
+    T y = mean3d[1];
+    T z = mean3d[2];
+
+    T r = sqrt(x * x + y * y + z * z + 1e-8f);
+    T xz_norm = sqrt(x * x + z * z + 1e-8f);
+
+    T denom_xz = x * x + z * z + 1e-8f;
+    T denom_r2 = r * r + 1e-8f;
+    // mat3x2 is 3 columns x 2 rows.
+    mat3x2<T> J = mat3x2<T>(
+        width / (2 * M_PI) * (z / denom_xz),
+        height / M_PI * (- (x * y) / (denom_r2 * xz_norm)), // 1st column
+        0.f,
+        height / M_PI * (xz_norm / denom_r2), // 2nd column
+        width / (2 * M_PI) * (-x / denom_xz),
+        height / M_PI * (- (z * y) / (denom_r2 * xz_norm)) // 3rd column
+    );
+    v_mean3d += glm::transpose(J) * v_mean2d;
+
+    v_cov3d += glm::transpose(J) * v_cov2d * J;
 }
 
 } // namespace gsplat

@@ -177,10 +177,26 @@ __global__ void fully_fused_projection_bwd_kernel(
                 image_height,
                 v_covar2d,
                 glm::make_vec2(v_means2d),
-                v_mean_c,
-                v_covar_c
-            );
-            break;
+            v_mean_c,
+            v_covar_c
+        );
+        break;
+    case CameraModelType::PANORAMA: // panoramic projection
+        panorama_proj_vjp<T>(
+            mean_c,
+            covar_c,
+            fx,
+            fy,
+            cx,
+            cy,
+            image_width,
+            image_height,
+            v_covar2d,
+            glm::make_vec2(v_means2d),
+            v_mean_c,
+            v_covar_c
+        );
+        break;
     }
 
     // add contribution from v_depths

@@ -104,14 +104,30 @@ __global__ void proj_bwd_kernel(
                 height,
                 glm::transpose(v_covar2d),
                 v_mean2d,
-                v_mean,
-                v_covar
-            );
-            break;
+            v_mean,
+            v_covar
+        );
+        break;
+    case CameraModelType::PANORAMA: // panoramic projection
+        panorama_proj_vjp<OpT>(
+            mean,
+            covar,
+            fx,
+            fy,
+            cx,
+            cy,
+            width,
+            height,
+            glm::transpose(v_covar2d),
+            v_mean2d,
+            v_mean,
+            v_covar
+        );
+        break;
     }
 
-    // write to outputs: glm is column-major but we want row-major
-    GSPLAT_PRAGMA_UNROLL
+// write to outputs: glm is column-major but we want row-major
+#pragma unroll
     for (uint32_t i = 0; i < 3; i++) { // rows
         GSPLAT_PRAGMA_UNROLL
         for (uint32_t j = 0; j < 3; j++) { // cols
