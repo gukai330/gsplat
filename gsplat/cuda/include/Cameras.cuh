@@ -1393,13 +1393,21 @@ struct OpenCVFisheyeCameraModel
     inline __device__ auto camera_ray_to_image_point_impl(const glm::fvec3 &cam_ray, float margin_factor) const ->
         typename Base::ImagePointReturn
     {
-        if(cam_ray.z <= 0.f)
-        {
-            return {
-                {0.f, 0.f},
-                false
-            };
-        }
+        // recon360: the upstream `if (cam_ray.z <= 0.f) return invalid;` used to sit
+        // here, and it is the single reason gsplat cannot render a fisheye wider than
+        // 180 deg (nerfstudio-project/gsplat#846). Nothing below it needs z > 0:
+        // theta comes from atan2(|xy|, z), which is already correct for z < 0, and the
+        // real limit is `max_angle`, enforced on `theta_full` at the end of this
+        // function. NVIDIA's own 3DGUT has no such check
+        // (3dgrut cameraProjections.cuh:120), so removing it aligns the port with the
+        // reference implementation rather than inventing behaviour.
+        //
+        // The one degenerate ray, x = y = 0 with z < 0, stays finite: cam_ray_xy_norm
+        // is floored at epsilon just below, so delta is large-but-finite and the point
+        // is rejected by the image-bounds test instead of producing a NaN.
+        //
+        // FTheta (the same guard around line 1610) is deliberately NOT patched: it is
+        // unused here and its backward polynomial is fitted over a different domain.
 
         // Make sure norm is non-vanishing (norm vanishes for points along the
         // principal-axis)
