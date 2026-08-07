@@ -128,6 +128,26 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # recon360: warm start. `ckpt` above is an EVAL-ONLY path (it loads splats then
+    # calls eval and returns). These two continue TRAINING from a checkpoint instead.
+    # init_ckpt loads the gaussians; init_step fast-forwards the LR schedulers so the
+    # run picks up the schedule of a max_steps-long run at that point, rather than
+    # restarting the decay. Without init_step a "continuation" would re-anneal the
+    # position LR from its initial value, which is a different optimisation
+    # trajectory, not a longer one.
+    init_ckpt: Optional[str] = None
+    init_step: int = 0
+    # write optimizer + MCMC strategy state into the checkpoint. Costs roughly 3x
+    # the file size (1.42 GB vs 0.47 at cap 2M) and MEASURES AS A WASH, so it is
+    # off: restoring Adam's moments across a 30k -> 60k continuation moved take2 by
+    # -0.004 dB / 0.0000 SSIM, an order of magnitude under the +/-0.04 dB noise
+    # floor. (An earlier A/B said "harmful"; that run was void -- load_state_dict
+    # also restored the saved LR, see the restore site.) There is no MCMC state to
+    # lose either -- MCMCStrategy's whole state is a precomputed binomial table.
+    # Turn it on to warm-start experiments that want the moments anyway.
+    save_train_state: bool = False
+    # set False to reproduce the stateless warm start, for the A/B
+    restore_train_state: bool = True
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
@@ -362,6 +382,7 @@ class Config:
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
+    with_eval3d: bool = False
     # recon360: for a fisheye wider than 180 deg, z-depth is the wrong quantity to
     # both cull and sort by -- half the field of view has z < 0, so near/far culling
     # (ProjectionUT3DGSFused.cu:131) deletes it and the sort key changes sign across
@@ -377,7 +398,6 @@ class Config:
     # expects, so nothing is converted or approximated. Needs --with_ut, because the
     # non-UT projection ignores radial_coeffs entirely (Utils.cuh fisheye_proj).
     undistort: bool = True
-    with_eval3d: bool = False
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -572,8 +592,8 @@ class Runner:
                 data_dir=cfg.data_dir,
                 factor=cfg.data_factor,
                 normalize=cfg.normalize_world_space,
-                undistort=cfg.undistort,
                 test_every=cfg.test_every,
+                undistort=cfg.undistort,
                 load_exposure=cfg.load_exposure,
             )
             self.trainset = Dataset(
@@ -583,6 +603,7 @@ class Runner:
                 load_depths=cfg.depth_loss,
                 load_mono_depth=cfg.mono_depth,
             )
+            self.valset = Dataset(self.parser, split="val")
         self.radial_coeffs_table = None
         if not cfg.undistort:
             import numpy as _np
@@ -597,7 +618,6 @@ class Runner:
                 print("[recon360] !! --with_ut is OFF, so the non-UT projection will "
                       "IGNORE these coefficients (Utils.cuh fisheye_proj is pure "
                       "equidistant). Add --with_ut --with_eval3d.")
-            self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -868,13 +888,13 @@ class Runner:
         tangential_coeffs = None
         thin_prism_coeffs = None
         with_ut = self.cfg.with_ut
+
         if (radial_coeffs is None and getattr(self, "radial_coeffs_table", None) is not None
                 and camera_idcs is not None):
             # shape must mirror viewmats' leading dims: this trainer passes
             # viewmats as [C, 4, 4] with no batch axis, so radial_coeffs is [C, 4].
             radial_coeffs = self.radial_coeffs_table[
                 camera_idcs.reshape(-1).long()].reshape(-1, 4)
-
         if camera_idcs is not None and hasattr(self, "ncore_camera_data"):
             cam = self.ncore_camera_data[camera_idcs.item()]
             camera_model = cam.camera_model
@@ -917,8 +937,8 @@ class Runner:
             distributed=self.world_size > 1,
             camera_model=camera_model,
             with_ut=with_ut,
-            global_z_order=self.cfg.global_z_order,
             with_eval3d=self.cfg.with_eval3d,
+            global_z_order=self.cfg.global_z_order,
             ftheta_coeffs=ftheta_coeffs,
             radial_coeffs=radial_coeffs,
             tangential_coeffs=tangential_coeffs,
@@ -1020,7 +1040,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        init_step = 0
+        init_step = cfg.init_step
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
@@ -1072,6 +1092,13 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
+        if init_step > 0:
+            for _ in range(init_step):
+                for scheduler in schedulers:
+                    scheduler.step()
+            print(f"[warm start] schedulers advanced to step {init_step}; "
+                  f"means lr {schedulers[0].get_last_lr()[0]:.3e}", flush=True)
+
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
             if not cfg.disable_viewer:
@@ -1323,6 +1350,19 @@ class Runner:
                     "scene_id": self.scene.id,
                     "splats": self.splats.state_dict(),
                 }
+                if cfg.save_train_state:
+                    # recon360: everything a TRUE continuation needs. Without it,
+                    # --init-ckpt restarts Adam's moments and the MCMC strategy's
+                    # own bookkeeping from scratch: measured, the first 2k-step
+                    # window after a warm start reads 0.0659 against the 0.0645 the
+                    # run ended on, and it takes ~8k steps to recover. Tensors are
+                    # moved to CPU so the file loads on any device.
+                    data["optimizers"] = {
+                        k: o.state_dict() for k, o in self.optimizers.items()}
+                    st = self.strategy_state
+                    data["strategy_state"] = {
+                        k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                        for k, v in st.items()} if isinstance(st, dict) else None
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1847,6 +1887,38 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
+        if cfg.init_ckpt is not None:
+            ck = torch.load(cfg.init_ckpt, map_location=runner.device, weights_only=False)
+            for k in runner.splats.keys():
+                runner.splats[k].data = ck["splats"][k].to(runner.device)
+            n_opt = 0
+            if cfg.restore_train_state and ck.get("optimizers"):
+                for k, st in ck["optimizers"].items():
+                    if k in runner.optimizers:
+                        opt = runner.optimizers[k]
+                        # load_state_dict ALSO restores param_groups, i.e. the LR
+                        # the saved run had decayed to (0.01x initial at the end of
+                        # its schedule). train() then builds ExponentialLR from
+                        # those groups and fast-forwards it, decaying a SECOND
+                        # time: measured 3.490e-07 against the stateless arm's
+                        # 3.489e-05 -- exactly 100x, which silently turned the
+                        # "does Adam state help" A/B into a "100x lower LR" A/B.
+                        # Only the moments belong to the checkpoint; the LR belongs
+                        # to the new schedule.
+                        lrs = [g["lr"] for g in opt.param_groups]
+                        opt.load_state_dict(st)
+                        for g, lr in zip(opt.param_groups, lrs):
+                            g["lr"] = lr
+                        n_opt += 1
+                if ck.get("strategy_state") and isinstance(runner.strategy_state, dict):
+                    for k, v in ck["strategy_state"].items():
+                        runner.strategy_state[k] = (
+                            v.to(runner.device) if torch.is_tensor(v) else v)
+            print(f"[warm start] loaded {len(runner.splats['means']):,} gaussians from "
+                  f"{cfg.init_ckpt} (saved at step {ck.get('step')}); "
+                  f"restored {n_opt} optimizer states"
+                  f"{' + strategy state' if n_opt and ck.get('strategy_state') else ''}",
+                  flush=True)
         runner.train()
         runner.export_ppisp_reports()
 
