@@ -119,17 +119,31 @@ class RigCameraOptModule(torch.nn.Module):
 
 
 def rig_groups_from_names(image_names):
-    """Group cubemap face images by their ERP frame.
+    """Group images that share one physical camera pose.
 
-    'c0_00001_f.jpg' -> rig key 'c0_00001'. Returns (group_ids, n_groups,
-    ref_index_per_group) where ref_index is the first image of each group in the
-    given order, used as the rig's reference frame.
+    Two layouts, and they need different keys:
+
+      cubemap  'c0_00001_f.jpg'    -> 'c0_00001'   (strip the face suffix)
+      fisheye  'e0/c0_00001.jpg'   -> 'c0_00001'   (strip the lens directory)
+
+    The cubemap rule applied to the fisheye layout is silently catastrophic:
+    rsplit('_', 1) on 'e0/c0_00001' yields 'e0/c0', so every frame of a whole
+    ffmpeg segment collapses into ONE rig and a single 6-DoF delta is asked to
+    move 250 frames at once. Detect the fisheye layout by the directory
+    component, which the cubemap layout never has.
+
+    Returns (group_ids, n_groups, ref_index_per_group); ref_index is the first
+    image of each group in the given order, used as the rig's reference frame.
     """
     import os as _os
 
+    nested = any("/" in n or "\\" in n for n in image_names)
     key_to_gid, group_ids, ref_index = {}, [], []
     for i, name in enumerate(image_names):
-        key = _os.path.splitext(name)[0].rsplit("_", 1)[0]
+        if nested:
+            key = _os.path.splitext(_os.path.basename(name.replace("\\", "/")))[0]
+        else:
+            key = _os.path.splitext(name)[0].rsplit("_", 1)[0]
         if key not in key_to_gid:
             key_to_gid[key] = len(ref_index)
             ref_index.append(i)
