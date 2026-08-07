@@ -449,11 +449,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_mono_depth: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_mono_depth = load_mono_depth
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -471,6 +473,19 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        # Per-image mask (COLMAP convention): <root>/masks/<image_name>.png, white=keep.
+        _img_path = self.parser.image_paths[index]
+        _mask_path = os.path.join(
+            os.path.dirname(os.path.dirname(_img_path)),
+            "masks",
+            os.path.basename(_img_path) + ".png",
+        )
+        if os.path.exists(_mask_path):
+            _pm = imageio.imread(_mask_path)
+            if _pm.ndim == 3:
+                _pm = _pm[..., 0]
+            _pm = _pm > 127
+            mask = _pm if mask is None else np.logical_and(mask, _pm)
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -502,6 +517,20 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+
+        # Dense monocular depth prior: <root>/mono_depth/<image_name>.npy, float16
+        # z-depth already aligned to the SfM scale (NaN where invalid).
+        if self.load_mono_depth:
+            _md_path = os.path.join(
+                os.path.dirname(os.path.dirname(_img_path)),
+                "mono_depth",
+                os.path.basename(_img_path) + ".npy",
+            )
+            if os.path.exists(_md_path):
+                _md = np.load(_md_path).astype(np.float32)
+                if self.patch_size is not None:
+                    _md = _md[y : y + self.patch_size, x : x + self.patch_size]
+                data["mono_depth"] = torch.from_numpy(_md)
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]

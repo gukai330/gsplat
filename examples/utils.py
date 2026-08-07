@@ -63,6 +63,84 @@ class CameraOptModule(torch.nn.Module):
         return torch.matmul(camtoworlds, transform)
 
 
+class RigCameraOptModule(torch.nn.Module):
+    """Camera pose optimization with a rigid-rig constraint (recon360).
+
+    Our training images are cubemap faces cut out of one ERP frame: the 5 faces of
+    a frame share a single physical camera centre and their relative rotations are
+    fixed by construction. Plain CameraOptModule gives every image its own delta,
+    so the faces drift apart and the rig geometry -- the one thing we actually know
+    exactly -- is destroyed to absorb photometric error.
+
+    This module keeps one 6-DoF delta per rig (ERP frame) and applies it to every
+    face of that frame as the same rigid world motion:
+
+        c2w_face' = C_ref @ T @ C_ref^-1 @ c2w_face
+
+    where C_ref is the (fixed) pose of the rig's reference face. Expanding it, a
+    point p maps to c + R_ref R R_ref^T (p - c) + R_ref dx, i.e. a rotation about
+    the shared centre c plus a translation -- exactly the 6 DoF the rig really has,
+    and identical for all 5 faces. Zero-init gives T = I, so training starts from
+    the SfM poses unchanged.
+    """
+
+    def __init__(self, group_ids: Tensor, ref_c2w: Tensor):
+        """
+        Args:
+            group_ids: (n_images,) int64, image index -> rig index
+            ref_c2w:   (n_rigs, 4, 4) pose of each rig's reference face, in the
+                       SAME normalized world frame the trainer feeds in
+        """
+        super().__init__()
+        self.embeds = torch.nn.Embedding(int(ref_c2w.shape[0]), 9)
+        self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
+        self.register_buffer("group_ids", group_ids.long())
+        self.register_buffer("ref_c2w", ref_c2w.float())
+        self.register_buffer("ref_c2w_inv", torch.linalg.inv(ref_c2w.float()))
+
+    def zero_init(self):
+        torch.nn.init.zeros_(self.embeds.weight)
+
+    def random_init(self, std: float):
+        torch.nn.init.normal_(self.embeds.weight, std=std)
+
+    def forward(self, camtoworlds: Tensor, embed_ids: Tensor) -> Tensor:
+        assert camtoworlds.shape[:-2] == embed_ids.shape
+        batch_dims = camtoworlds.shape[:-2]
+        gid = self.group_ids[embed_ids]  # (...,)
+        pose_deltas = self.embeds(gid)  # (..., 9)
+        dx, drot = pose_deltas[..., :3], pose_deltas[..., 3:]
+        rot = rotation_6d_to_matrix(drot + self.identity.expand(*batch_dims, -1))
+        transform = torch.eye(4, device=pose_deltas.device).repeat((*batch_dims, 1, 1))
+        transform[..., :3, :3] = rot
+        transform[..., :3, 3] = dx
+        # world-side conjugation by the rig's reference pose
+        return self.ref_c2w[gid] @ transform @ self.ref_c2w_inv[gid] @ camtoworlds
+
+
+def rig_groups_from_names(image_names):
+    """Group cubemap face images by their ERP frame.
+
+    'c0_00001_f.jpg' -> rig key 'c0_00001'. Returns (group_ids, n_groups,
+    ref_index_per_group) where ref_index is the first image of each group in the
+    given order, used as the rig's reference frame.
+    """
+    import os as _os
+
+    key_to_gid, group_ids, ref_index = {}, [], []
+    for i, name in enumerate(image_names):
+        key = _os.path.splitext(name)[0].rsplit("_", 1)[0]
+        if key not in key_to_gid:
+            key_to_gid[key] = len(ref_index)
+            ref_index.append(i)
+        group_ids.append(key_to_gid[key])
+    return (
+        torch.tensor(group_ids, dtype=torch.long),
+        len(ref_index),
+        torch.tensor(ref_index, dtype=torch.long),
+    )
+
+
 class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 

@@ -52,7 +52,15 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraOptModule,
+    RigCameraOptModule,
+    knn,
+    rig_groups_from_names,
+    rgb_to_sh,
+    set_random_seed,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -73,6 +81,45 @@ from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+
+
+def _srgb_to_linear(x: Tensor) -> Tensor:
+    x = x.clamp(min=0.0)
+    return torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(x: Tensor) -> Tensor:
+    # The clamp inside the power branch is load-bearing, not defensive. torch.where
+    # evaluates both branches in backward, d/dx x**(1/2.4) is infinite at x = 0, and
+    # 0 * inf = NaN -- so without it the loss goes NaN a few hundred steps in and
+    # MCMC dies inside multinomial sampling on an all-NaN opacity vector.
+    x = x.clamp(min=0.0)
+    return torch.where(x <= 0.0031308, x * 12.92,
+                       1.055 * x.clamp(min=1e-8) ** (1 / 2.4) - 0.055)
+
+
+def apply_exposure_prior(colors: Tensor, exposure: Tensor, alpha: Tensor) -> Tensor:
+    """Re-expose the render to each image's capture exposure, in LINEAR light.
+
+    Two corrections over the first version of this, both measured in
+    reports/camera_metadata_review.md:
+
+    1. The gain goes on linear radiance, not on the gamma-encoded render. The
+       renders and the JPEG targets live in sRGB, so a raw multiply there is off
+       by roughly the 2.4 exponent.
+    2. The coefficient `alpha` is not pinned to 1. alpha=1 is the textbook
+       pixel = radiance * shutter model, which needs a transparent ISP. This
+       footage is auto-exposed: shutter is ANTI-correlated with frame brightness
+       (r = -0.676 over take2's 860 frames), so alpha=1 amplifies the photometric
+       inconsistency 3.9x. Let the data set alpha -- if the shutter track carries
+       nothing usable, alpha goes to 0 and this reduces to the plain path.
+    """
+    gain = torch.exp2(alpha * exposure).reshape(-1, 1, 1, 1)
+    rgb = _linear_to_srgb(_srgb_to_linear(colors[..., :3]) * gain)
+    if colors.shape[-1] == 3:
+        return rgb
+    return torch.cat([rgb, colors[..., 3:]], dim=-1)
+
 
 
 @dataclass
@@ -106,6 +153,22 @@ class Config:
     camera_model: CameraModel = "pinhole"
     # Load EXIF exposure metadata from images (if available)
     load_exposure: bool = True
+    # Apply centred EXIF exposure to RGB on the plain reg0 rendering path.
+    # OFF by default: the implemented gain is 2**EV, which assumes pixel value is
+    # proportional to radiance*shutter. This footage is auto-exposed, so shutter is
+    # ANTI-correlated with frame brightness (r=-0.676 on take2's 860 frames) and the
+    # gain amplifies the photometric inconsistency 3.9x instead of removing it.
+    # See reports/camera_metadata_review.md before turning this back on.
+    apply_exposure_prior: bool = False
+    # Coefficient on the centred EV. 1.0 is the naive radiance*shutter model and is
+    # wrong for auto-exposed footage; the take2 least-squares fit is about -0.22 in
+    # sRGB terms. Prefer --exposure_alpha_learnable and let training settle it.
+    exposure_alpha: float = 1.0
+    # Optimise exposure_alpha as a single global scalar (1 parameter, so it cannot
+    # overfit, and unlike --app_opt it applies to held-out views too because the
+    # shutter is recorded for every frame).
+    exposure_alpha_learnable: bool = False
+    exposure_alpha_lr: float = 1e-2
     # Backend to train on: "cuda" for standard multi-process training,
     # or "dgx" for torch-dgx single-process multi-GPU training.
     backend: str = "cuda"
@@ -131,6 +194,11 @@ class Config:
 
     # Port for the viewer server
     port: int = 8080
+
+    # recon360: expose the RNG seed. It was hardcoded to 42, which makes it
+    # impossible to repeat a config and measure the run-to-run noise floor -- and
+    # without that floor a +-0.1 dB ablation delta cannot be called signal or noise.
+    seed: int = 42
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
@@ -209,8 +277,28 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
+    # recon360: adaptive regularizer guard. The MCMC opacity/scale penalty grows
+    # with the gaussian count while the data term does not, so at a high cap (or
+    # with a weak data term -- exposure flicker, soft poses) the scene silently
+    # goes transparent and PSNR lands at 8-13 dB. Watch median sigmoid(opacity)
+    # and back the penalty off before that happens instead of making the user
+    # guess --reg per dataset.
+    adaptive_reg: bool = False
+    # Back off when the median opacity drops below this (healthy runs measured
+    # 0.02-0.09; fully collapsed runs measured 1.6e-6).
+    adaptive_reg_median: float = 5e-3
+    # How often to check
+    adaptive_reg_every: int = 200
+    # Multiply both regularizers by this on each trigger
+    adaptive_reg_factor: float = 0.5
+    # Stop backing off here (0.0 = allow disabling the regularizer entirely)
+    adaptive_reg_min: float = 0.0
+
     # Enable camera optimization.
     pose_opt: bool = False
+    # recon360: constrain pose_opt to one 6-DoF delta per cubemap rig (ERP frame)
+    # instead of one per image, so a frame's faces cannot drift apart.
+    pose_opt_rig: bool = False
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -248,6 +336,22 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+
+    # recon360: DENSE monocular depth prior (scripts/mono_depth.py writes
+    # <data_dir>/mono_depth/<image>.npy). Note --depth_loss above supervises with
+    # SfM *sparse* point depths -- a few hundred pixels per image -- which is the
+    # same weak data term we are trying to prop up. This one covers every pixel.
+    mono_depth: bool = False
+    # Weight for the monocular depth loss
+    mono_depth_lambda: float = 0.05
+    # "pearson": 1 - Pearson correlation of disparities, invariant to any residual
+    #   per-image scale+shift left over from the SfM alignment.
+    # "l1": L1 straight on the aligned depth -- a stronger constraint,
+    #   but it trusts the per-image affine fit.
+    mono_depth_mode: Literal["pearson", "l1"] = "pearson"
+    # Stop applying the prior after this step (-1 = never). Late in training the
+    # photometric term should own the fine detail.
+    mono_depth_stop_iter: int = -1
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -365,13 +469,18 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    # recon360 fix: `fused` is a torch.optim.Adam argument. SelectiveAdam takes only
+    # (params, eps, betas) and SparseAdam has no fused path either, so passing it
+    # unconditionally makes --visible_adam and --sparse_grad die at startup with
+    # "TypeError: SelectiveAdam.__init__() got an unexpected keyword argument 'fused'".
+    extra_opt_kwargs = {"fused": True} if optimizer_class is torch.optim.Adam else {}
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+            **extra_opt_kwargs,
         )
         for name, _, lr in params
     }
@@ -384,7 +493,7 @@ class Runner:
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
-        set_random_seed(42 + local_rank)
+        set_random_seed(cfg.seed + local_rank)
 
         self.cfg = cfg
         self.world_rank = world_rank
@@ -407,6 +516,9 @@ class Runner:
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+
+        # recon360: record of every adaptive_reg back-off, dumped next to the stats
+        self.adaptive_reg_events = []
 
         # Load data: Training data should contain initial points and colors.
         if cfg.data_type == "ncore":
@@ -453,6 +565,7 @@ class Runner:
                 split="train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
+                load_mono_depth=cfg.mono_depth,
             )
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -526,7 +639,25 @@ class Runner:
 
         self.pose_optimizers = []
         if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+            if cfg.pose_opt_rig:
+                # image_id in a batch is the index into the TRAINSET, so the rig
+                # grouping and the reference poses must be built over trainset
+                # order too -- and from parser.camtoworlds, which is already in
+                # the normalized world frame the trainer trains in.
+                tr_idx = self.trainset.indices
+                names = [self.parser.image_names[i] for i in tr_idx]
+                group_ids, n_rigs, ref_local = rig_groups_from_names(names)
+                ref_c2w = torch.from_numpy(
+                    np.stack([self.parser.camtoworlds[tr_idx[j]] for j in ref_local.tolist()])
+                ).float()
+                self.pose_adjust = RigCameraOptModule(group_ids, ref_c2w).to(self.device)
+                print(
+                    f"[pose_opt_rig] {len(names)} train images -> {n_rigs} rigs "
+                    f"({len(names)/max(n_rigs,1):.1f} faces/rig), "
+                    f"{n_rigs*6} free pose parameters instead of {len(names)*6}"
+                )
+            else:
+                self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_adjust.zero_init()
             self.pose_optimizers = [
                 torch.optim.Adam(
@@ -587,6 +718,16 @@ class Runner:
                 num_frames=len(self.trainset),
                 config=ppisp_config,
             ).to(self.device)
+
+        # Global coefficient on the recorded EV. One scalar, shared by every image,
+        # so it carries over to held-out views -- which is exactly what app_opt and
+        # bilagrid cannot do (their correction lives in a per-training-image module).
+        self.exposure_alpha = torch.tensor(
+            float(cfg.exposure_alpha), device=self.device,
+            requires_grad=cfg.exposure_alpha_learnable)
+        self.exposure_alpha_optimizers = (
+            [torch.optim.Adam([self.exposure_alpha], lr=cfg.exposure_alpha_lr)]
+            if cfg.exposure_alpha_learnable else [])
 
         self.post_processing_optimizers = []
         if cfg.post_processing == "bilateral_grid":
@@ -747,6 +888,12 @@ class Runner:
             thin_prism_coeffs=thin_prism_coeffs,
             **kwargs,
         )
+        if (exposure is not None and self.cfg.apply_exposure_prior
+                and self.cfg.post_processing is None):
+            # The splats represent reference-exposure radiance; compare each
+            # image against a render scaled to that capture exposure.
+            render_colors = apply_exposure_prior(
+                render_colors, exposure, self.exposure_alpha)
         if masks is not None:
             render_colors[~masks] = 0
 
@@ -791,6 +938,38 @@ class Runner:
             )
 
         return render_colors, render_alphas, info
+
+    def mono_depth_loss(self, depths, gt, alphas, masks):
+        """recon360: dense monocular depth prior against the rendered depth.
+
+        depths [B,H,W,1] rendered expected depth, gt [B,H,W] prior (NaN = invalid),
+        alphas [B,H,W,1], masks [B,H,W] bool or None.
+
+        Pixels are only supervised where the render is actually opaque -- an
+        under-populated region renders alpha~0 with a meaningless expected depth,
+        and pulling that toward the prior would fight densification rather than help it.
+        """
+        cfg = self.cfg
+        d = depths[..., 0]
+        valid = torch.isfinite(gt) & (gt > 0) & (alphas[..., 0] > 0.5) & (d > 0)
+        if masks is not None:
+            valid = valid & masks
+        n = int(valid.sum())
+        if n < 1024:
+            return depths.new_zeros(())
+
+        if cfg.mono_depth_mode == "pearson":
+            # Correlate in disparity space: bounded, invariant to any residual
+            # per-image scale+shift, and it weights near geometry rather than
+            # letting one distant surface dominate the statistic.
+            x = (1.0 / d.clamp_min(1e-6))[valid]
+            y = (1.0 / gt.clamp_min(1e-6))[valid]
+            x = x - x.mean()
+            y = y - y.mean()
+            return 1.0 - (x * y).sum() / (x.norm() * y.norm()).clamp_min(1e-8)
+        # "l1": trusts the per-image affine alignment; normalized by scene scale
+        # so the weight means the same thing across captures.
+        return (d[valid] - gt[valid]).abs().mean() / self.scene_scale
 
     def train(self):
         cfg = self.cfg
@@ -893,6 +1072,9 @@ class Runner:
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
+            mono_depth_gt = (
+                data["mono_depth"].to(device) if "mono_depth" in data else None
+            )  # [1, H, W], NaN where the prior is invalid
 
             height, width = pixels.shape[1:3]
 
@@ -916,7 +1098,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                render_mode="RGB+ED" if (cfg.depth_loss or cfg.mono_depth) else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
@@ -978,6 +1160,16 @@ class Runner:
                     depths, depths_gt, scene_scale=self.scene_scale
                 )
                 loss += depthloss * cfg.depth_lambda
+            if (
+                cfg.mono_depth
+                and mono_depth_gt is not None
+                and depths is not None
+                and (cfg.mono_depth_stop_iter < 0 or step < cfg.mono_depth_stop_iter)
+            ):
+                monodepthloss = self.mono_depth_loss(
+                    depths, mono_depth_gt, alphas, masks
+                )
+                loss = loss + cfg.mono_depth_lambda * monodepthloss
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -996,6 +1188,41 @@ class Runner:
                 loss += cfg.scale_reg * scale_reg_loss(self.splats["scales"])
 
             loss.backward()
+
+            # recon360: adaptive regularizer guard. One-directional -- we only ever
+            # back the penalty off, never restore it, so the run cannot oscillate.
+            if (
+                cfg.adaptive_reg
+                and step > 0
+                and step % cfg.adaptive_reg_every == 0
+                and (cfg.opacity_reg > 0.0 or cfg.scale_reg > 0.0)
+            ):
+                with torch.no_grad():
+                    opa_med = torch.sigmoid(self.splats["opacities"]).median().item()
+                if world_rank == 0 and self.writer is not None:
+                    self.writer.add_scalar("train/opacity_median", opa_med, step)
+                if opa_med < cfg.adaptive_reg_median:
+                    old_o, old_s = cfg.opacity_reg, cfg.scale_reg
+                    cfg.opacity_reg = max(
+                        cfg.adaptive_reg_min, cfg.opacity_reg * cfg.adaptive_reg_factor
+                    )
+                    cfg.scale_reg = max(
+                        cfg.adaptive_reg_min, cfg.scale_reg * cfg.adaptive_reg_factor
+                    )
+                    print(
+                        f"\n[adaptive_reg] step {step}: median opacity {opa_med:.2e} < "
+                        f"{cfg.adaptive_reg_median:.1e} (collapse risk) -- backing reg off "
+                        f"{old_o:.4g}/{old_s:.4g} -> {cfg.opacity_reg:.4g}/{cfg.scale_reg:.4g}",
+                        flush=True,
+                    )
+                    self.adaptive_reg_events.append(
+                        {
+                            "step": step,
+                            "opa_median": opa_med,
+                            "opacity_reg": cfg.opacity_reg,
+                            "scale_reg": cfg.scale_reg,
+                        }
+                    )
 
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1041,6 +1268,10 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
+                    # allocated is what the tensors need; reserved is what the
+                    # caching allocator holds on the device and is the number that
+                    # decides whether a second job fits. They differ by ~2x here.
+                    "mem_reserved": torch.cuda.max_memory_reserved() / 1024**3,
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
@@ -1067,6 +1298,30 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
+                if cfg.apply_exposure_prior:
+                    # eval_masked has to re-expose with the SAME coefficient, so the
+                    # checkpoint carries it rather than relying on a matching flag.
+                    data["exposure_alpha"] = float(self.exposure_alpha.detach())
+                    print(f"[exposure] alpha = {float(self.exposure_alpha.detach()):+.4f}"
+                          f" ({'learned' if cfg.exposure_alpha_learnable else 'fixed'})")
+                if cfg.adaptive_reg:
+                    # recon360: keep the back-off history with the checkpoint, so a
+                    # run's effective regularizer is recoverable after the fact.
+                    data["adaptive_reg_events"] = self.adaptive_reg_events
+                    data["adaptive_reg_final"] = {
+                        "opacity_reg": cfg.opacity_reg,
+                        "scale_reg": cfg.scale_reg,
+                    }
+                    with open(f"{self.stats_dir}/adaptive_reg.json", "w") as f:
+                        json.dump(
+                            {
+                                "events": self.adaptive_reg_events,
+                                "final_opacity_reg": cfg.opacity_reg,
+                                "final_scale_reg": cfg.scale_reg,
+                            },
+                            f,
+                            indent=1,
+                        )
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1145,6 +1400,9 @@ class Runner:
             for optimizer in self.post_processing_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.exposure_alpha_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1216,6 +1474,9 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
+            if masks is not None:
+                # zero both sides at masked pixels so metrics ignore them
+                pixels[~masks] = 0.0
             height, width = pixels.shape[1:3]
 
             # Exposure metadata is available for any image with EXIF data (train or val)
