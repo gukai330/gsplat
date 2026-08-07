@@ -473,18 +473,37 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        # Keyed on the COLMAP image NAME, not on basename(path). A rig dataset stores
+        # images as "e0/frame.jpg", one directory deeper, and the old
+        # dirname(dirname(path)) form then resolved to <root>/images/masks/frame.jpg.png
+        # -- which does not exist, so every mask was silently skipped and three fisheye
+        # runs trained with no operator mask at all. Flat datasets (the ERP cube ones)
+        # resolve identically under both forms, so this is not a behaviour change there.
         # Per-image mask (COLMAP convention): <root>/masks/<image_name>.png, white=keep.
         _img_path = self.parser.image_paths[index]
         _mask_path = os.path.join(
-            os.path.dirname(os.path.dirname(_img_path)),
-            "masks",
-            os.path.basename(_img_path) + ".png",
+            self.parser.data_dir, "masks", self.parser.image_names[index] + ".png"
         )
         if os.path.exists(_mask_path):
             _pm = imageio.imread(_mask_path)
             if _pm.ndim == 3:
+            # Masks may be stored at reduced resolution -- they are a preprocessing
+            # product, not data, and a person boundary carries no high-frequency
+            # information worth 1920x1920. Nearest-neighbour back up to the image
+            # so the rest of the pipeline never has to know.
+            if _pm.shape[:2] != image.shape[:2]:
+                _pm = cv2.resize(
+                    _pm, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST
+                )
                 _pm = _pm[..., 0]
             _pm = _pm > 127
+        elif os.path.isdir(os.path.join(self.parser.data_dir, "masks")):
+            # A masks/ directory exists but this image's mask is not in it. Silence here
+            # is what let the bug above run for three trainings, so make it loud once.
+            if not getattr(Dataset, "_mask_warned", False):
+                Dataset._mask_warned = True
+                print(f"[Dataset] WARNING: masks/ exists but {_mask_path} is missing -- "
+                      f"training WITHOUT per-image masks", flush=True)
             mask = _pm if mask is None else np.logical_and(mask, _pm)
 
         if len(params) > 0:
