@@ -127,10 +127,19 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        undistort: bool = True,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
+        # recon360: undistort=False keeps the images exactly as captured and hands the
+        # distortion to the rasterizer instead. Required for fisheye: the code below
+        # remaps an OPENCV_FISHEYE camera to a PERSPECTIVE image, which is impossible
+        # past ~120 deg and silently destroys a >180 deg dataset. gsplat's 3DGUT path
+        # models OPENCV_FISHEYE natively (Cameras.cuh OpenCVFisheyeCameraModel is
+        # Kannala-Brandt, same 4 coefficients COLMAP stores), so undistorting is not
+        # only lossy here, it is unnecessary.
+        self.undistort = undistort
         self.test_every = test_every
         self.load_exposure = load_exposure
 
@@ -371,6 +380,8 @@ class Parser:
             params = self.params_dict[camera_id]
             if len(params) == 0:
                 continue  # no distortion
+            if not self.undistort:
+                continue  # distortion is handled by the rasterizer
             camtype = camtype_dict[camera_id]
             assert camera_id in self.Ks_dict, f"Missing K for camera {camera_id}"
             assert (
@@ -473,13 +484,13 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        # Per-image mask (COLMAP convention): <root>/masks/<image_name>.png, white=keep.
         # Keyed on the COLMAP image NAME, not on basename(path). A rig dataset stores
         # images as "e0/frame.jpg", one directory deeper, and the old
         # dirname(dirname(path)) form then resolved to <root>/images/masks/frame.jpg.png
         # -- which does not exist, so every mask was silently skipped and three fisheye
         # runs trained with no operator mask at all. Flat datasets (the ERP cube ones)
         # resolve identically under both forms, so this is not a behaviour change there.
-        # Per-image mask (COLMAP convention): <root>/masks/<image_name>.png, white=keep.
         _img_path = self.parser.image_paths[index]
         _mask_path = os.path.join(
             self.parser.data_dir, "masks", self.parser.image_names[index] + ".png"
@@ -487,6 +498,7 @@ class Dataset:
         if os.path.exists(_mask_path):
             _pm = imageio.imread(_mask_path)
             if _pm.ndim == 3:
+                _pm = _pm[..., 0]
             # Masks may be stored at reduced resolution -- they are a preprocessing
             # product, not data, and a person boundary carries no high-frequency
             # information worth 1920x1920. Nearest-neighbour back up to the image
@@ -495,8 +507,8 @@ class Dataset:
                 _pm = cv2.resize(
                     _pm, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST
                 )
-                _pm = _pm[..., 0]
             _pm = _pm > 127
+            mask = _pm if mask is None else np.logical_and(mask, _pm)
         elif os.path.isdir(os.path.join(self.parser.data_dir, "masks")):
             # A masks/ directory exists but this image's mask is not in it. Silence here
             # is what let the bug above run for three trainings, so make it loud once.
@@ -504,9 +516,8 @@ class Dataset:
                 Dataset._mask_warned = True
                 print(f"[Dataset] WARNING: masks/ exists but {_mask_path} is missing -- "
                       f"training WITHOUT per-image masks", flush=True)
-            mask = _pm if mask is None else np.logical_and(mask, _pm)
 
-        if len(params) > 0:
+        if len(params) > 0 and getattr(self.parser, "undistort", True):
             # Images are distorted. Undistort them.
             mapx, mapy = (
                 self.parser.mapx_dict[camera_id],

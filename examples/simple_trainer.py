@@ -362,6 +362,21 @@ class Config:
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
+    # recon360: for a fisheye wider than 180 deg, z-depth is the wrong quantity to
+    # both cull and sort by -- half the field of view has z < 0, so near/far culling
+    # (ProjectionUT3DGSFused.cu:131) deletes it and the sort key changes sign across
+    # the equator. gsplat already supports Euclidean distance instead; it just was
+    # not exposed here. Set False together with --camera_model fisheye --with_ut
+    # whenever the FOV exceeds 180 deg.
+    global_z_order: bool = True
+    # recon360: keep the images as captured and let the rasterizer model the lens.
+    # The Parser otherwise remaps OPENCV_FISHEYE to a perspective image, which cannot
+    # represent a >180 deg fisheye at all. With this off, the COLMAP distortion
+    # coefficients are forwarded to gsplat as `radial_coeffs` instead -- for
+    # OPENCV_FISHEYE they are the same Kannala-Brandt k1..k4 the CUDA camera model
+    # expects, so nothing is converted or approximated. Needs --with_ut, because the
+    # non-UT projection ignores radial_coeffs entirely (Utils.cuh fisheye_proj).
+    undistort: bool = True
     with_eval3d: bool = False
 
     def adjust_steps(self, factor: float):
@@ -557,6 +572,7 @@ class Runner:
                 data_dir=cfg.data_dir,
                 factor=cfg.data_factor,
                 normalize=cfg.normalize_world_space,
+                undistort=cfg.undistort,
                 test_every=cfg.test_every,
                 load_exposure=cfg.load_exposure,
             )
@@ -567,6 +583,20 @@ class Runner:
                 load_depths=cfg.depth_loss,
                 load_mono_depth=cfg.mono_depth,
             )
+        self.radial_coeffs_table = None
+        if not cfg.undistort:
+            import numpy as _np
+            _tbl = torch.zeros(self.parser.num_cameras, 4)
+            for _cid, _idx in self.parser.camera_id_to_idx.items():
+                _p = _np.asarray(self.parser.params_dict[_cid], dtype=_np.float32)
+                _tbl[_idx, : min(4, len(_p))] = torch.from_numpy(_p[:4])
+            self.radial_coeffs_table = _tbl.to(self.device)
+            print(f"[recon360] undistort=False: forwarding radial_coeffs for "
+                  f"{self.parser.num_cameras} camera(s) -> {_tbl.tolist()}")
+            if not cfg.with_ut:
+                print("[recon360] !! --with_ut is OFF, so the non-UT projection will "
+                      "IGNORE these coefficients (Utils.cuh fisheye_proj is pure "
+                      "equidistant). Add --with_ut --with_eval3d.")
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -838,6 +868,12 @@ class Runner:
         tangential_coeffs = None
         thin_prism_coeffs = None
         with_ut = self.cfg.with_ut
+        if (radial_coeffs is None and getattr(self, "radial_coeffs_table", None) is not None
+                and camera_idcs is not None):
+            # shape must mirror viewmats' leading dims: this trainer passes
+            # viewmats as [C, 4, 4] with no batch axis, so radial_coeffs is [C, 4].
+            radial_coeffs = self.radial_coeffs_table[
+                camera_idcs.reshape(-1).long()].reshape(-1, 4)
 
         if camera_idcs is not None and hasattr(self, "ncore_camera_data"):
             cam = self.ncore_camera_data[camera_idcs.item()]
@@ -881,6 +917,7 @@ class Runner:
             distributed=self.world_size > 1,
             camera_model=camera_model,
             with_ut=with_ut,
+            global_z_order=self.cfg.global_z_order,
             with_eval3d=self.cfg.with_eval3d,
             ftheta_coeffs=ftheta_coeffs,
             radial_coeffs=radial_coeffs,
