@@ -1891,6 +1891,19 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             ck = torch.load(cfg.init_ckpt, map_location=runner.device, weights_only=False)
             for k in runner.splats.keys():
                 runner.splats[k].data = ck["splats"][k].to(runner.device)
+            # The scene's component bookkeeping (GaussianScene.component_index)
+            # was sized at SfM init; the loaded checkpoint replaces the params
+            # with a different N. MCMC relocation then indexes component_index
+            # with indices up to the new N -> device-side assert. Latent until a
+            # continuation opens the refine window past init_step (the default
+            # refine_stop_iter=25000 kept relocation off in every earlier warm
+            # start). Rebuild scene + stage exactly as the eval-only path does;
+            # from_splats reuses the ParameterDict, so optimizer references to
+            # the Parameters stay valid.
+            runner.scene = GaussianScene.from_splats(runner.splats, id="scene")
+            runner.splats = runner.scene.splats
+            runner.stage = Stage()
+            runner.stage.add_scene(runner.scene, runner.rasterize_splats)
             n_opt = 0
             if cfg.restore_train_state and ck.get("optimizers"):
                 for k, st in ck["optimizers"].items():
