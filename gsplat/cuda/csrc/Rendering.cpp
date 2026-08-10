@@ -856,10 +856,20 @@ Rasterization3DGSResult rasterization_3dgs(
     bool return_normals,
     int64_t renderer_config,
     const at::optional<std::string> &process_group_name,
-    int64_t world_size
+    int64_t world_size,
+    int64_t per_pixel_sort_window
 )
 {
     DEVICE_GUARD(means);
+
+    // StopThePop-style per-pixel depth resorting: render-only, eval3d-only.
+    // Deeper constraints (no grads, MixedBatch, tile_size 16, <= 4 channels
+    // per raster pass) are enforced where they bind, in the raster op.
+    TORCH_CHECK(
+        per_pixel_sort_window == 0 || with_eval3d,
+        "per_pixel_sort_window > 0 requires with_eval3d=True (the per-ray "
+        "max-response depth is defined by the 3D evaluation)"
+    );
 
     // A non-empty process-group name selects the multi-GPU distributed path.
     // Input validation, including distributed-mode rejection, lives in
@@ -1463,7 +1473,8 @@ Rasterization3DGSResult rasterization_3dgs(
                 return_normals && start == 0,
                 renderer_config,
                 false, // return_last_ids
-                false  // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                false, // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                per_pixel_sort_window
             );
             render_color_chunks.push_back(raster.renders);
             if(!render_alphas.defined())

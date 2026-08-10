@@ -287,6 +287,7 @@ def rasterization(
         int
     ] = None,  # Currently only None or 3 is accepted.
     renderer_config: Optional[RendererConfig] = None,
+    per_pixel_sort_window: int = 0,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -477,6 +478,17 @@ def rasterization(
             :class:`RendererConfig_MixedBatch`, which uses the existing mixed-batch
             rasterizer implementation. Non-default configs require
             ``with_eval3d=True``.
+        per_pixel_sort_window: 0 (default) keeps the stock per-tile blending
+            order. A window size in {4, 8, 16, 24} enables StopThePop-style
+            per-pixel depth resorting (https://arxiv.org/abs/2402.00525) on the
+            eval3d forward: each pixel re-sorts gaussians by the depth of
+            maximum response along its own ray inside a sliding window of this
+            size, removing the popping caused by 16x16-tile-granular sorting.
+            Render-only (no backward — call under ``torch.no_grad()``);
+            requires ``with_eval3d=True``; forces ``tile_size=16``; supports at
+            most 4 feature channels per raster pass (RGB / RGB+depth). Only the
+            paper's sorting is ported: its 2D-footprint culling contradicts the
+            UT projection's 3D along-ray evaluation and is deliberately absent.
 
     Returns:
         A tuple:
@@ -526,6 +538,18 @@ def rasterization(
     if lidar_coeffs is not None:
         width = lidar_coeffs.n_columns
         height = lidar_coeffs.n_rows
+
+    if per_pixel_sort_window not in (0, 4, 8, 16, 24):
+        raise ValueError(
+            "per_pixel_sort_window must be one of {0, 4, 8, 16, 24}, got "
+            f"{per_pixel_sort_window}"
+        )
+    if per_pixel_sort_window > 0:
+        if not with_eval3d:
+            raise ValueError("per_pixel_sort_window > 0 requires with_eval3d=True")
+        # The resorted kernel is one-thread-per-pixel; override the
+        # resolution-dependent tile-8 default rather than erroring later.
+        tile_size = 16
 
     tile_size = _resolve_tile_size(tile_size, with_eval3d, width, height)
 
@@ -641,6 +665,7 @@ def rasterization(
         renderer_config_impl,
         process_group_name,
         world_size,
+        per_pixel_sort_window,
     )
 
     if absgrad and not with_eval3d:

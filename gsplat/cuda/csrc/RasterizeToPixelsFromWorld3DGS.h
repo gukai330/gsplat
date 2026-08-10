@@ -32,6 +32,49 @@ class Tensor;
 
 namespace gsplat
 {
+// StopThePop-style per-pixel depth-resorted forward (render-only). Restricted
+// instantiation set: channels {1,2,3,4}, tile_size 16, window {4,8,16,24},
+// no normals, no batch-state persistence. See
+// RasterizeToPixelsFromWorld3DGSSortedFwd.cu for the design notes.
+void launch_rasterize_to_pixels_from_world_3dgs_sorted_fwd_kernel(
+    // Gaussian parameters
+    const at::Tensor means,                     // [..., N, 3]
+    const at::Tensor quats,                     // [..., N, 4]
+    const at::Tensor scales,                    // [..., N, 3]
+    const at::Tensor colors,                    // [..., C, N, channels]
+    const at::Tensor opacities,                 // [..., C, N]
+    const at::optional<at::Tensor> backgrounds, // [..., C, channels]
+    const at::optional<at::Tensor> masks,       // [..., C, tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // camera
+    const at::Tensor viewmats0,               // [..., C, 4, 4]
+    const at::optional<at::Tensor> viewmats1, // [..., C, 4, 4] optional for rolling shutter
+    const at::Tensor Ks,                      // [..., C, 3, 3]
+    const CameraModelType camera_model,
+    // unscented transform
+    const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
+    ShutterType rs_type,
+    const at::optional<at::Tensor> rays,              // [..., C, H, W, 6]
+    const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
+    const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
+    const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
+    const c10::intrusive_ptr<FThetaCameraDistortionParameters> &ftheta_coeffs,
+    const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
+    // external distortion
+    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
+    // intersections
+    const at::Tensor isect_offsets, // [..., C, tile_height, tile_width]
+    const at::Tensor flatten_ids,   // [n_isects]
+    const bool use_hit_distance,
+    const int64_t per_pixel_sort_window,
+    // outputs
+    at::Tensor renders, // [..., C, image_height, image_width, channels]
+    at::Tensor alphas   // [..., C, image_height, image_width]
+);
+
 void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     // Gaussian parameters
     const at::Tensor means,                     // [..., N, 3]

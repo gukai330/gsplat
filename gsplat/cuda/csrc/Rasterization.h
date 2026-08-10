@@ -553,7 +553,10 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     bool return_last_ids,
     const at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width] optional
     const at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3] optional output tensor
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    // > 0 selects the render-only StopThePop-style per-pixel resorted forward
+    // (window sizes {4, 8, 16, 24}); requires fwd_only + MixedBatch.
+    int64_t per_pixel_sort_window
 );
 
 // Public op result type. The single dispatcher entry below returns this and the
@@ -625,6 +628,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
     bool return_normals,
     int64_t renderer_config,
     bool return_last_ids,
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    // > 0 selects the render-only StopThePop-style per-pixel resorted forward
+    // (window sizes {4, 8, 16, 24}); rejected when any input requires grad.
+    int64_t per_pixel_sort_window
 );
 } // namespace gsplat

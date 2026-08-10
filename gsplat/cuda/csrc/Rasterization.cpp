@@ -2407,7 +2407,8 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     const bool return_last_ids,
     const at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width] optional
     const at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3] optional output tensor
-    const bool unsafe_masked_tile_outputs
+    const bool unsafe_masked_tile_outputs,
+    const int64_t per_pixel_sort_window
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -2450,6 +2451,24 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
         "fwd-only eval3d rasterization cannot return sample_counts; "
         "request exact metadata instead"
     );
+    // Per-pixel depth resorting is a render-only path: blending order is part
+    // of the autograd contract and the resorted kernel has no backward, so it
+    // is reachable only through the state-light fwd-only MixedBatch shortcut.
+    if(per_pixel_sort_window > 0)
+    {
+        TORCH_CHECK(
+            fwd_only && renderer_config == RendererConfig::MIXED_BATCH,
+            "per_pixel_sort_window > 0 is render-only: it requires the fwd-only "
+            "MixedBatch path (no gradients, no last_ids/sample_counts)"
+        );
+        TORCH_CHECK(
+            !normals.has_value(), "per_pixel_sort_window > 0 does not support return_normals"
+        );
+        TORCH_CHECK(
+            !unsafe_masked_tile_outputs,
+            "per_pixel_sort_window > 0 supports only the safe masked-tile output mode"
+        );
+    }
 
     // Validate inputs.
     // The leading `dim()` clauses short-circuit before the prefix slices, so a
@@ -2704,7 +2723,44 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     }
 
     // --- Launch selected forward kernel -----------------------------------
-    if(renderer_config == RendererConfig::MIXED_BATCH)
+    if(per_pixel_sort_window > 0)
+    {
+        // Render-only StopThePop-style per-pixel resorted forward. No batch
+        // state, no exact metadata; the guards above pinned fwd_only +
+        // MixedBatch so none of those buffers are expected downstream.
+        launch_rasterize_to_pixels_from_world_3dgs_sorted_fwd_kernel(
+            means,
+            quats,
+            scales,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            image_width,
+            image_height,
+            tile_size,
+            viewmats0,
+            viewmats1,
+            Ks,
+            camera_model,
+            ut_params,
+            rs_type,
+            rays,
+            radial_coeffs,
+            tangential_coeffs,
+            thin_prism_coeffs,
+            ftheta_coeffs,
+            lidar_coeffs,
+            external_distortion_params,
+            tile_offsets,
+            flatten_ids,
+            use_hit_distance,
+            per_pixel_sort_window,
+            renders,
+            alphas
+        );
+    }
+    else if(renderer_config == RendererConfig::MIXED_BATCH)
     {
         launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
             means,
@@ -3256,7 +3312,8 @@ namespace
                 /*return_last_ids=*/true,
                 optional_outputs.sample_counts,
                 optional_outputs.normals,
-                unsafe_masked_tile_outputs
+                unsafe_masked_tile_outputs,
+                /*per_pixel_sort_window=*/0
             );
 
             // --- Save state for backward --------------------------------------
@@ -3475,7 +3532,8 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
     bool return_normals,
     int64_t renderer_config,
     bool return_last_ids,
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    int64_t per_pixel_sort_window
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -3499,6 +3557,20 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
         thin_prism_coeffs,
         tile_offsets,
         flatten_ids
+    );
+
+    // Per-pixel resorted rendering changes the blending order, which the
+    // backward walk reconstructs from the sorted intersection list; there is
+    // no backward for the resorted forward. Reject instead of silently
+    // rendering something autograd cannot differentiate.
+    TORCH_CHECK(
+        per_pixel_sort_window == 0 || !use_custom_autograd,
+        "per_pixel_sort_window > 0 has no backward; render under torch.no_grad() "
+        "(or detach all inputs)"
+    );
+    TORCH_CHECK(
+        per_pixel_sort_window == 0 || !(return_last_ids || return_sample_counts),
+        "per_pixel_sort_window > 0 cannot return last_ids or sample_counts"
     );
 
     if(!use_custom_autograd)
@@ -3543,7 +3615,8 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
             return_last_ids,
             optional_outputs.sample_counts,
             optional_outputs.normals,
-            unsafe_masked_tile_outputs
+            unsafe_masked_tile_outputs,
+            per_pixel_sort_window
         );
         return {
             .renders       = fwd.renders,

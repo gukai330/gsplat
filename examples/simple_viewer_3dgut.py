@@ -211,6 +211,16 @@ def main(local_rank: int, world_rank, world_size: int, args):
             camera_model=gui_dropdown_camera_type.value,  # "pinhole" or "fisheye"
             with_ut=gui_ckeckbox_3dgut.value,
             with_eval3d=gui_ckeckbox_3dgut.value,
+            # Euclidean-distance sorting: what wide-FOV 3DGUT models are
+            # trained with, and the correct coarse order for per-pixel sort
+            # (it equals the max-response depth along each center ray).
+            global_z_order=not gui_ckeckbox_3dgut.value,
+            # StopThePop-style per-pixel depth resorting (render-only, eval3d).
+            per_pixel_sort_window=(
+                int(gui_dropdown_sort_window.value)
+                if gui_ckeckbox_ppsort.value and gui_ckeckbox_3dgut.value
+                else 0
+            ),
             radial_coeffs=radial_coeffs,
             tangential_coeffs=tangential_coeffs,
             thin_prism_coeffs=thin_prism_coeffs,
@@ -226,6 +236,12 @@ def main(local_rank: int, world_rank, world_size: int, args):
     )
     gui_dropdown_camera_type = server.gui.add_dropdown(
         "Camera Type", ("pinhole", "fisheye"), initial_value="pinhole"
+    )
+    gui_ckeckbox_ppsort = server.gui.add_checkbox(
+        "Per-pixel depth sort (StopThePop)", initial_value=False
+    )
+    gui_dropdown_sort_window = server.gui.add_dropdown(
+        "Sort window", ("4", "8", "16", "24"), initial_value="16"
     )
     gui_slider_radial_coeffs1 = server.gui.add_slider(
         "radial coeffs: k1", min=-1.0, max=1.0, step=0.01, initial_value=0
@@ -247,6 +263,8 @@ def main(local_rank: int, world_rank, world_size: int, args):
     )
 
     @gui_ckeckbox_3dgut.on_update
+    @gui_ckeckbox_ppsort.on_update
+    @gui_dropdown_sort_window.on_update
     @gui_dropdown_camera_type.on_update
     @gui_slider_radial_coeffs1.on_update
     @gui_slider_radial_coeffs2.on_update
