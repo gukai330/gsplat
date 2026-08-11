@@ -279,6 +279,25 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
+    # recon360: global directional sky/background model (sky_model.py). A tiny
+    # SH-of-view-direction environment composited at the random_bkgd site:
+    # colors + sky(dir) * (1 - alpha). Direction-only is what keeps it valid on
+    # held-out views (app_opt/bilagrid/ppisp all measured negative there because
+    # their correction is keyed to training images). With --sky_mask_dir set,
+    # pixels labelled sky (white, eroded masks -- see fisheye_sky_mask.py) also
+    # get a BCE pushing alpha toward 0, which is what actually transfers the sky
+    # from gaussians to the background; MCMC then relocates the freed budget.
+    sky_model: bool = False
+    # SH degree of the sky model ((d+1)^2 coeffs x 3 channels)
+    sky_sh_degree: int = 3
+    # dir with <image_name>.png sky masks, WHITE = sky. None -> composite only,
+    # no alpha pressure.
+    sky_mask_dir: Optional[str] = None
+    # weight of the alpha->0 BCE on sky pixels
+    sky_alpha_lambda: float = 0.05
+    # LR for the sky SH coefficients
+    sky_lr: float = 1e-2
+
     # LR for 3D point positions
     means_lr: float = 1.6e-4
     # LR for Gaussian scale factors
@@ -602,6 +621,7 @@ class Runner:
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
                 load_mono_depth=cfg.mono_depth,
+                sky_mask_dir=cfg.sky_mask_dir,
             )
             self.valset = Dataset(self.parser, split="val")
         self.radial_coeffs_table = None
@@ -663,6 +683,21 @@ class Runner:
         )
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
         self.splats = self.scene.splats
+
+        # recon360: global directional sky/background model
+        self.sky_module = None
+        self.sky_optimizers = []
+        if cfg.sky_model:
+            from sky_model import SkyModel, SkyRayCache
+
+            self.sky_module = SkyModel(cfg.sky_sh_degree).to(self.device)
+            self.sky_optimizers = [
+                torch.optim.Adam(self.sky_module.parameters(), lr=cfg.sky_lr)
+            ]
+            self.sky_rays = SkyRayCache(cfg.camera_model, self.device)
+            print(f"[recon360] sky model on: SH degree {cfg.sky_sh_degree}, "
+                  f"masks {cfg.sky_mask_dir or '(none: composite only)'}, "
+                  f"alpha lambda {cfg.sky_alpha_lambda}")
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
         print("Model initialized. Number of GS:", len(self.splats["means"]))
@@ -996,6 +1031,17 @@ class Runner:
 
         return render_colors, render_alphas, info
 
+    def sky_background(self, camera_idx, Ks, camtoworlds, width, height):
+        """[1, H, W, 3] sky RGB for this view, from the same KB unprojection
+        the rasterizer's fisheye path models (radial_coeffs included)."""
+        idx = int(camera_idx.reshape(-1)[0])
+        rc = None
+        if getattr(self, "radial_coeffs_table", None) is not None:
+            rc = self.radial_coeffs_table[idx]
+        dirs = self.sky_rays.dirs_world(
+            idx, Ks[0], width, height, camtoworlds[0], rc)
+        return self.sky_module(dirs)
+
     def mono_depth_loss(self, depths, gt, alphas, masks):
         """recon360: dense monocular depth prior against the rendered depth.
 
@@ -1177,6 +1223,11 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            if self.sky_module is not None:
+                sky_rgb = self.sky_background(
+                    data["camera_idx"], Ks, camtoworlds, width, height)
+                colors = colors + sky_rgb * (1.0 - alphas)
+
             # While Gaussians are frozen for PPISP controller distillation the render
             # output has requires_grad=False, so densification bookkeeping (e.g.
             # DefaultStrategy's retain_grad) is both invalid and unnecessary.
@@ -1205,6 +1256,19 @@ class Runner:
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            skyloss = None
+            if self.sky_module is not None and "sky_mask" in data:
+                # BCE pushing alpha -> 0 where the (eroded) sky mask says sky.
+                # Spatially targeted, unlike the global opacity_reg mean that
+                # collapses scenes here -- but watch ckpt_health's opacity
+                # median on any new capture anyway.
+                skym = data["sky_mask"].to(device)  # [1, H, W]
+                if masks is not None:
+                    skym = skym & masks
+                if skym.any():
+                    a = alphas[..., 0][skym].clamp(max=1.0 - 1e-6)
+                    skyloss = -torch.log1p(-a).mean()
+                    loss = loss + cfg.sky_alpha_lambda * skyloss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1311,6 +1375,8 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if skyloss is not None:
+                    self.writer.add_scalar("train/skyloss", skyloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
@@ -1375,6 +1441,11 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
+                if self.sky_module is not None:
+                    # eval_masked composites the same background, so the
+                    # checkpoint carries the model, not a matching flag.
+                    data["sky_module"] = self.sky_module.state_dict()
+                    data["sky_sh_degree"] = cfg.sky_sh_degree
                 if cfg.apply_exposure_prior:
                     # eval_masked has to re-expose with the SAME coefficient, so the
                     # checkpoint carries it rather than relying on a matching flag.
@@ -1480,6 +1551,9 @@ class Runner:
             for optimizer in self.exposure_alpha_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.sky_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1561,7 +1635,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.stage.render(
+            colors, alphas, _ = self.stage.render(
                 self.scene.id,
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1575,6 +1649,11 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )  # [1, H, W, 3]
+            if self.sky_module is not None:
+                with torch.no_grad():
+                    sky_rgb = self.sky_background(
+                        data["camera_idx"], Ks, camtoworlds, width, height)
+                    colors = colors + sky_rgb * (1.0 - alphas)
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -1891,6 +1970,8 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             ck = torch.load(cfg.init_ckpt, map_location=runner.device, weights_only=False)
             for k in runner.splats.keys():
                 runner.splats[k].data = ck["splats"][k].to(runner.device)
+            if runner.sky_module is not None and "sky_module" in ck:
+                runner.sky_module.load_state_dict(ck["sky_module"])
             # The scene's component bookkeeping (GaussianScene.component_index)
             # was sized at SfM init; the loaded checkpoint replaces the params
             # with a different N. MCMC relocation then indexes component_index

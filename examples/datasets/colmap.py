@@ -461,12 +461,17 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         load_mono_depth: bool = False,
+        sky_mask_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.load_mono_depth = load_mono_depth
+        # recon360: <sky_mask_dir>/<image_name>.png, WHITE = sky. Not a COLMAP
+        # keep-mask -- it marks pixels where the trainer's sky background model
+        # may push gaussian alpha toward 0 (see simple_trainer's sky_model).
+        self.sky_mask_dir = sky_mask_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -547,6 +552,22 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+
+        if self.sky_mask_dir is not None and self.patch_size is None:
+            _sm_path = os.path.join(
+                self.sky_mask_dir, self.parser.image_names[index] + ".png"
+            )
+            if os.path.exists(_sm_path):
+                _sm = imageio.imread(_sm_path)
+                if _sm.ndim == 3:
+                    _sm = _sm[..., 0]
+                if _sm.shape[:2] != image.shape[:2]:
+                    _sm = cv2.resize(
+                        _sm,
+                        (image.shape[1], image.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                data["sky_mask"] = torch.from_numpy(_sm > 127)
 
         # Dense monocular depth prior: <root>/mono_depth/<image_name>.npy, float16
         # z-depth already aligned to the SfM scale (NaN where invalid).
