@@ -297,6 +297,13 @@ class Config:
     sky_alpha_lambda: float = 0.05
     # LR for the sky SH coefficients
     sky_lr: float = 1e-2
+    # sky_init.pt from scripts/fisheye_bg_sphere.py: SH fitted to the capture's own
+    # rotation-aligned per-direction median. The SH endpoint does not depend on this
+    # (48 smooth parameters converge either way, measured), but the GAUSSIANS' does:
+    # with a correct background from step 0 the BCE has something to hand the sky to
+    # immediately, so the shell may never be built rather than being built and pushed
+    # off. MCMC relocation history is path-dependent.
+    sky_init: Optional[str] = None
 
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -691,6 +698,15 @@ class Runner:
             from sky_model import SkyModel, SkyRayCache
 
             self.sky_module = SkyModel(cfg.sky_sh_degree).to(self.device)
+            if cfg.sky_init is not None:
+                _si = torch.load(cfg.sky_init, map_location=self.device,
+                                 weights_only=False)
+                if int(_si["sh_degree"]) != cfg.sky_sh_degree:
+                    raise ValueError(
+                        f"--sky_init was fitted at SH degree {_si['sh_degree']} but "
+                        f"--sky_sh_degree is {cfg.sky_sh_degree}")
+                self.sky_module.coeffs.data = _si["coeffs"].to(self.device)
+                print(f"[recon360] sky initialised from {cfg.sky_init}")
             self.sky_optimizers = [
                 torch.optim.Adam(self.sky_module.parameters(), lr=cfg.sky_lr)
             ]
