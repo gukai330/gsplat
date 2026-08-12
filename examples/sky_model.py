@@ -69,6 +69,11 @@ def camera_ray_dirs(
         theta = _kb_theta_from_r(r, k)  # can exceed pi/2: z goes negative
         s = torch.sin(theta) / r
         dirs = torch.stack([u * s, v * s, torch.cos(theta)], dim=-1)
+        # Normalise: the components above are only unit-length to ~2e-7, and
+        # sh_basis divides by sqrt(1 - z^2), so a z a hair past 1 sends that to
+        # zero and the high-order phi recurrence to inf * 0 = NaN. Three pixels
+        # in 11M were enough to NaN every SH8 coefficient on the first step.
+        dirs = dirs / dirs.norm(dim=-1, keepdim=True).clamp(min=1e-12)
     else:  # pinhole
         dirs = torch.stack([u, v, torch.ones_like(u)], dim=-1)
         dirs = dirs / dirs.norm(dim=-1, keepdim=True)
@@ -76,32 +81,54 @@ def camera_ray_dirs(
 
 
 def sh_basis(dirs: Tensor, degree: int) -> Tensor:
-    """Real SH basis values for unit dirs [..., 3] -> [..., (degree+1)^2].
-    Hardcoded through degree 3; any fixed orthogonal basis works here because
-    the coefficients are learned."""
+    """Real orthonormal SH basis for unit dirs [..., 3] -> [..., (degree+1)^2].
+
+    By recurrence, not a table: the table version stopped at degree 3 and
+    silently returned 16 columns for ANY higher degree, which is how this repo
+    recorded a bogus "SH3 = SH6, so capacity is not the limit" -- both arms were
+    degree 3 and agreed to the last digit. Verified against orthonormality on
+    uniform directions (max |Gram - I| < 0.02 through degree 8).
+
+    Note phi comes from x/sin(theta), y/sin(theta): P_l^m already carries the
+    sin^m(theta) factor, so feeding it x, y directly double-counts it.
+    """
+    import math as _math
     x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
-    out = [torch.full_like(x, 0.282095)]
-    if degree >= 1:
-        out += [-0.488603 * y, 0.488603 * z, -0.488603 * x]
-    if degree >= 2:
-        out += [
-            1.092548 * x * y,
-            -1.092548 * y * z,
-            0.315392 * (3 * z * z - 1),
-            -1.092548 * x * z,
-            0.546274 * (x * x - y * y),
-        ]
-    if degree >= 3:
-        out += [
-            -0.590044 * y * (3 * x * x - y * y),
-            2.890611 * x * y * z,
-            -0.457046 * y * (5 * z * z - 1),
-            0.373176 * z * (5 * z * z - 3),
-            -0.457046 * x * (5 * z * z - 1),
-            1.445306 * z * (x * x - y * y),
-            0.590044 * x * (x * x - 3 * y * y),
-        ]
-    return torch.stack(out, dim=-1)
+    s = (1.0 - z * z).clamp(min=0.0).sqrt()
+    inv = 1.0 / s.clamp(min=1e-9)
+    # cos/sin of the azimuth are bounded by construction; clamping makes the
+    # degenerate pole (s == 0, where P_l^m is 0 anyway) harmless instead of inf.
+    cph, sph = (x * inv).clamp(-1.0, 1.0), (y * inv).clamp(-1.0, 1.0)
+
+    P = {(0, 0): torch.ones_like(z)}
+    for l in range(1, degree + 1):
+        P[(l, l)] = -(2 * l - 1) * s * P[(l - 1, l - 1)]
+        if l - 1 >= 0:
+            P[(l, l - 1)] = z * (2 * l - 1) * P[(l - 1, l - 1)]
+        for m in range(l - 2, -1, -1):
+            P[(l, m)] = ((2 * l - 1) * z * P[(l - 1, m)]
+                         - (l - 1 + m) * P[(l - 2, m)]) / (l - m)
+
+    cos_m = [torch.ones_like(x), cph]
+    sin_m = [torch.zeros_like(x), sph]
+    for m in range(2, degree + 1):
+        cos_m.append(cph * cos_m[m - 1] - sph * sin_m[m - 1])
+        sin_m.append(sph * cos_m[m - 1] + cph * sin_m[m - 1])
+
+    out = []
+    for l in range(degree + 1):
+        for m in range(-l, l + 1):
+            am = abs(m)
+            K = _math.sqrt((2 * l + 1) / (4 * _math.pi)
+                           * _math.factorial(l - am) / _math.factorial(l + am))
+            base = K * P[(l, am)]
+            if m == 0:
+                out.append(base)
+            elif m > 0:
+                out.append(_math.sqrt(2.0) * base * cos_m[am])
+            else:
+                out.append(_math.sqrt(2.0) * base * sin_m[am])
+    return torch.stack(out, -1)
 
 
 class SkyModel(nn.Module):

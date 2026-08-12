@@ -297,6 +297,18 @@ class Config:
     sky_alpha_lambda: float = 0.05
     # LR for the sky SH coefficients
     sky_lr: float = 1e-2
+    # Apply the alpha BCE to every valid pixel instead of a sky mask. Only has an
+    # effect when --sky_mask_dir is unset.
+    sky_bce_everywhere: bool = False
+    # Seed the point cloud with N extra points on a distant sphere, coloured by
+    # the sky model in --sky_init. The alternative to a background function: give
+    # the sky its own dedicated far gaussians from step 0, so MCMC never has to
+    # manufacture a depth-scattered shell to explain sky pixels.
+    sky_sphere_points: int = 0
+    # radius of that sphere, in units of the camera-cloud radius
+    sky_sphere_radius: float = 8.0
+    # evaluate the SH background every Nth pixel and bilinearly upsample
+    sky_eval_stride: int = 4
     # sky_init.pt from scripts/fisheye_bg_sphere.py: SH fitted to the capture's own
     # rotation-aligned per-direction median. The SH endpoint does not depend on this
     # (48 smooth parameters converge either way, measured), but the GAUSSIANS' does:
@@ -631,6 +643,32 @@ class Runner:
                 sky_mask_dir=cfg.sky_mask_dir,
             )
             self.valset = Dataset(self.parser, split="val")
+        if cfg.sky_sphere_points > 0:
+            import numpy as _np
+            _cams = _np.asarray(self.parser.camtoworlds, float)[:, :3, 3]
+            _ctr = _cams.mean(0)
+            _rad = float(_np.linalg.norm(_cams - _ctr, axis=1).max()) * cfg.sky_sphere_radius
+            _n = cfg.sky_sphere_points
+            _i = _np.arange(_n) + 0.5                      # Fibonacci sphere
+            _phi = _np.arccos(1 - 2 * _i / _n)
+            _th = _np.pi * (1 + 5 ** 0.5) * _i
+            _d = _np.stack([_np.cos(_th) * _np.sin(_phi), _np.sin(_th) * _np.sin(_phi),
+                            _np.cos(_phi)], 1)
+            if cfg.sky_init is not None:
+                from sky_model import SkyModel as _SM
+                _si = torch.load(cfg.sky_init, map_location="cpu", weights_only=False)
+                _m = _SM(int(_si["sh_degree"]))
+                _m.coeffs.data = _si["coeffs"]
+                with torch.no_grad():
+                    _rgb = _m(torch.from_numpy(_d).float()).numpy() * 255.0
+            else:
+                _rgb = _np.full((_n, 3), 200.0)
+            self.parser.points = _np.concatenate([self.parser.points, _ctr + _rad * _d])
+            self.parser.points_rgb = _np.concatenate(
+                [self.parser.points_rgb, _rgb]).astype(self.parser.points_rgb.dtype)
+            print(f"[recon360] seeded {_n} sky-sphere points at {_rad:.2f} "
+                  f"({cfg.sky_sphere_radius:g}x the camera radius)")
+
         self.radial_coeffs_table = None
         if not cfg.undistort:
             import numpy as _np
@@ -1054,9 +1092,20 @@ class Runner:
         rc = None
         if getattr(self, "radial_coeffs_table", None) is not None:
             rc = self.radial_coeffs_table[idx]
+        # Evaluate on a coarse grid and upsample. A degree-d SH is band-limited
+        # far below pixel resolution, but sh_basis materialises (d+1)^2 tensors
+        # the size of the image: at degree 8 that is 81 x 14.7 MB per step, ~2.5
+        # GB of intermediates, which is enough to wedge two concurrent trainings
+        # on a 10 GB card (measured -- both froze at ~700 steps).
+        step = max(1, int(self.cfg.sky_eval_stride))
         dirs = self.sky_rays.dirs_world(
             idx, Ks[0], width, height, camtoworlds[0], rc)
-        return self.sky_module(dirs)
+        if step == 1:
+            return self.sky_module(dirs)
+        coarse = self.sky_module(dirs[:, ::step, ::step])
+        return torch.nn.functional.interpolate(
+            coarse.permute(0, 3, 1, 2), size=(height, width),
+            mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
 
     def mono_depth_loss(self, depths, gt, alphas, masks):
         """recon360: dense monocular depth prior against the rendered depth.
@@ -1273,7 +1322,18 @@ class Runner:
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             skyloss = None
-            if self.sky_module is not None and "sky_mask" in data:
+            if (self.sky_module is not None and "sky_mask" not in data
+                    and cfg.sky_alpha_lambda > 0 and cfg.sky_bce_everywhere):
+                # No sky mask at all: push alpha toward 0 on EVERY valid pixel and
+                # let the photometric term hold up whatever is really there. The
+                # mask machinery is what produced the protection rings welded to
+                # the cables, so this asks whether the data alone can do the job.
+                a = alphas[..., 0]
+                if masks is not None:
+                    a = a[masks]
+                skyloss = -torch.log1p(-a.clamp(max=1.0 - 1e-6)).mean()
+                loss = loss + cfg.sky_alpha_lambda * skyloss
+            elif self.sky_module is not None and "sky_mask" in data:
                 # BCE pushing alpha -> 0 where the (eroded) sky mask says sky.
                 # Spatially targeted, unlike the global opacity_reg mean that
                 # collapses scenes here -- but watch ckpt_health's opacity
