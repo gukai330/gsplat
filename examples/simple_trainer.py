@@ -32,6 +32,7 @@ import tyro
 import viser
 import yaml
 from gsplat.color_correct import color_correct_affine, color_correct_quadratic
+from contraction import PositionContraction
 from datasets.colmap import Dataset, Parser
 from datasets.traj import (
     generate_ellipse_path_z,
@@ -79,6 +80,7 @@ except ModuleNotFoundError as e:
     ) from e
 from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import inject_noise_to_position
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -317,6 +319,19 @@ class Config:
     # off. MCMC relocation history is path-dependent.
     sky_init: Optional[str] = None
 
+    # recon360: optimise POSITIONS in a contracted radial domain -- the optimiser
+    # holds `u`, the rasterizer gets `x = uncontract(u)`. "none" is a true no-op.
+    # Motivation and the measurements it rests on: examples/contraction.py and
+    # reports/contracted_position_report.md. Note the far field's problem is NOT
+    # gradient conditioning (Adam divides that out); it is that the angular step
+    # falls as 1/r and the far radius is set by MCMC noise rather than the loss.
+    position_contraction: Literal["none", "log", "mip360"] = "none"
+    # Where the contraction starts, in world units of the NORMALIZED frame.
+    # Defaults to parser.scene_scale, the camera-cloud radius -- which is also the
+    # constant means_lr is multiplied by, so ry = 1 is at once the edge of the
+    # walked region, the contraction boundary, and the unit of the position LR.
+    contraction_radius: Optional[float] = None
+
     # LR for 3D point positions
     means_lr: float = 1.6e-4
     # LR for Gaussian scale factors
@@ -490,6 +505,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    contraction: Optional[PositionContraction] = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm" or init_type == "lidar":
         points = torch.from_numpy(parser.points).float()
@@ -513,6 +529,14 @@ def create_splats_with_optimizers(
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
+    # recon360: store the contracted coordinate. AFTER knn, which needs real
+    # world distances to size the initial gaussians. `u` is in world units and
+    # the map is the identity inside the contraction radius, so `means_lr *
+    # scene_scale` keeps its exact meaning -- including the value the trainer
+    # later hands to MCMC as its noise scale.
+    if contraction is not None and contraction.active:
+        points = contraction.to_param(points)
 
     params = [
         # name, value, lr
@@ -692,6 +716,43 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
+        # recon360: the position parameterisation. Built before the splats,
+        # because create_splats_with_optimizers stores `u` rather than `x`. The
+        # centre is the camera centroid: a radial contraction has to have one,
+        # and that is the only centre the rest of this route already agrees on
+        # (it is what the probes in reports/contracted_position_report.md bin
+        # about). The radius is parser.scene_scale -- the RAW camera-cloud
+        # radius, not self.scene_scale, which carries an extra 1.1 * global_scale.
+        self.contraction = PositionContraction(
+            cfg.position_contraction,
+            torch.as_tensor(self.parser.camtoworlds[:, :3, 3]).float().mean(0),
+            float(cfg.contraction_radius if cfg.contraction_radius is not None
+                  else self.parser.scene_scale),
+        ).to(self.device)
+        if self.contraction.active:
+            print(f"[recon360] {self.contraction}", flush=True)
+
+        # recon360: MCMC adds its position noise as `Sigma @ xi` in WORLD space,
+        # in place on params["means"] -- which under contraction is `u`. Feeding a
+        # world covariance to a contracted coordinate would fling the far field by
+        # a factor of J. So the strategy's own injection is switched off and the
+        # trainer does the round trip: uncontract, perturb, contract back. That is
+        # exact, not the first-order `J^-1 Sigma J^-T`, and it keeps the existing
+        # fused CUDA kernel. relocate/sample_add need nothing: they copy the
+        # position verbatim, and a verbatim copy is the same point either way --
+        # which is also why contraction cannot touch MCMC's inward budget drift.
+        self._mcmc_noise_stop = None
+        if self.contraction.active and isinstance(cfg.strategy, MCMCStrategy):
+            self._mcmc_noise_stop = cfg.strategy.noise_injection_stop_iter
+            cfg.strategy.noise_injection_stop_iter = 0  # off, inside the strategy
+        if self.contraction.active and cfg.sparse_grad:
+            raise ValueError(
+                "--sparse_grad with --position_contraction is untested: the "
+                "position gradient now reaches the parameter through the "
+                "contraction map, and the dense->sparse conversion in the train "
+                "loop indexes the parameter's own .grad. Verify it before using "
+                "the two together.")
+
         if self.parser.num_cameras > 1 and cfg.batch_size != 1:
             raise ValueError(
                 f"When using multiple cameras ({self.parser.num_cameras} found), batch_size must be 1, "
@@ -728,6 +789,7 @@ class Runner:
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
             feature_dim=feature_dim,
+            contraction=self.contraction,
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
@@ -932,6 +994,27 @@ class Runner:
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
 
+    @torch.no_grad()
+    def _inject_noise_in_world(self, step: int, lr: float) -> None:
+        """recon360: MCMC's position noise, applied in world space under a
+        contracted parameterisation. See the note in __init__."""
+        strat = self.cfg.strategy
+        stop = self._mcmc_noise_stop
+        if stop is not None and stop >= 0 and step >= stop:
+            return
+        world = self.contraction.to_world(self.splats["means"].detach()).contiguous()
+        inject_noise_to_position(
+            params={"means": world, "quats": self.splats["quats"],
+                    "scales": self.splats["scales"],
+                    "opacities": self.splats["opacities"]},
+            optimizers={},
+            state={},
+            noise_scale=lr * strat.noise_lr,
+            t=strat.noise_opacity_t,
+            k=strat.noise_opacity_k,
+        )
+        self.splats["means"].data.copy_(self.contraction.to_param(world))
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -948,7 +1031,11 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         splats = splats if splats is not None else self.splats
-        means = splats["means"]  # [N, 3]
+        # recon360: `means` is the PARAMETER. Under --position_contraction that is
+        # a contracted coordinate, and everything below -- the rasterizer, and
+        # app_opt's view directions -- needs world space. This is the single place
+        # the map is applied in the forward pass, so autograd delivers J^T here.
+        means = self.contraction.to_world(splats["means"])  # [N, 3]
         # quats = F.normalize(splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
         quats = splats["quats"]  # [N, 4]
@@ -1498,6 +1585,19 @@ class Runner:
                     "scene_id": self.scene.id,
                     "splats": self.splats.state_dict(),
                 }
+                if self.contraction.active:
+                    # recon360: a checkpoint always stores WORLD means. That keeps
+                    # every downstream reader working unchanged (gsplat_data's
+                    # load_splats, export_ply, ckpt_health, tsdf_from_splats,
+                    # viewer_qt) and stops a .pt existing whose coordinate
+                    # convention is only recoverable from the run's flags.
+                    # --init-ckpt re-contracts on load. Saved Adam moments, if
+                    # any, are u-space and stay consistent because the means they
+                    # are restored alongside get contracted back.
+                    data["splats"] = dict(data["splats"])
+                    data["splats"]["means"] = self.contraction.to_world(
+                        self.splats["means"].detach())
+                    data["position_contraction"] = self.contraction.state()
                 if cfg.save_train_state:
                     # recon360: everything a TRUE continuation needs. Without it,
                     # --init-ckpt restarts Adam's moments and the MCMC strategy's
@@ -1574,7 +1674,7 @@ class Runner:
                     sh0 = self.splats["sh0"]
                     shN = self.splats["shN"]
 
-                means = self.splats["means"]
+                means = self.contraction.to_world(self.splats["means"].detach())
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
@@ -1621,6 +1721,10 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # recon360: mip360's domain has a finite boundary -- |u - c| = 2R is
+            # infinity, and one step past it gives a negative radius. No-op for
+            # `log`, which has no boundary, and for `none`.
+            self.contraction.clamp_(self.splats["means"].data)
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1663,6 +1767,9 @@ class Runner:
                     lr=schedulers[0].get_last_lr()[0],
                     scene=self.scene,
                 )
+                if self.contraction.active:
+                    self._inject_noise_in_world(
+                        step, lr=schedulers[0].get_last_lr()[0])
             else:
                 assert_never(self.cfg.strategy)
 
@@ -2034,6 +2141,10 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        # recon360: checkpoints always store WORLD means; the parameter is `u`.
+        # No-op unless --position_contraction is on.
+        runner.splats["means"].data = runner.contraction.to_param(
+            runner.splats["means"].data)
         runner.scene = GaussianScene.from_splats(runner.splats, id="scene")
         runner.splats = runner.scene.splats
         runner.stage = Stage()
@@ -2052,6 +2163,9 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             ck = torch.load(cfg.init_ckpt, map_location=runner.device, weights_only=False)
             for k in runner.splats.keys():
                 runner.splats[k].data = ck["splats"][k].to(runner.device)
+            # recon360: as above -- the file is world, the parameter is `u`.
+            runner.splats["means"].data = runner.contraction.to_param(
+                runner.splats["means"].data)
             if runner.sky_module is not None and "sky_module" in ck:
                 runner.sky_module.load_state_dict(ck["sky_module"])
             # The scene's component bookkeeping (GaussianScene.component_index)
