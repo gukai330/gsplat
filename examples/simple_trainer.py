@@ -335,12 +335,18 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    # recon360: adaptive regularizer guard. The MCMC opacity/scale penalty grows
-    # with the gaussian count while the data term does not, so at a high cap (or
-    # with a weak data term -- exposure flicker, soft poses) the scene silently
-    # goes transparent and PSNR lands at 8-13 dB. Watch median sigmoid(opacity)
-    # and back the penalty off before that happens instead of making the user
-    # guess --reg per dataset.
+    # recon360: adaptive regularizer guard. On the ERP-cube route the MCMC
+    # opacity/scale penalty can take the scene fully transparent at a high cap
+    # (or with a weak data term -- exposure flicker, soft poses) and PSNR lands
+    # at 8-13 dB. Watch median sigmoid(opacity) and back the penalty off before
+    # that happens instead of making the user guess --reg per dataset.
+    # NOT because "the penalty grows with the gaussian count": opacity_reg_loss
+    # is sigmoid(opacities).mean(), a mean, which does not scale with N. The
+    # cap-dependence is measured; the mechanism is not established. The guard
+    # also does NOT rescue a collapse (10.78 dB vs 18.64 for plain reg 0) --
+    # by the time opacity has fallen the damage is done. On the fisheye-native
+    # route reg 0.01 does not collapse at all and is the default there
+    # (2026-08-15, reports/reg_default_report.md).
     adaptive_reg: bool = False
     # Back off when the median opacity drops below this (healthy runs measured
     # 0.02-0.09; fully collapsed runs measured 1.6e-6).
