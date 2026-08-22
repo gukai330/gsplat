@@ -569,13 +569,16 @@ class Dataset:
                     )
                 data["sky_mask"] = torch.from_numpy(_sm > 127)
 
-        # Dense monocular depth prior: <root>/mono_depth/<image_name>.npy, float16
-        # z-depth already aligned to the SfM scale (NaN where invalid).
+        # Dense monocular depth prior: <data_dir>/mono_depth/<image_name>.npy,
+        # float16. On the fisheye path (global_z_order False) the rendered ED is
+        # Euclidean DISTANCE, so the .npy must store distance, not z. Keyed on
+        # the COLMAP image NAME like the mask loader (basename collides between
+        # the rig's e0/ and e1/ subdirs -- same bug the mask loader had).
         if self.load_mono_depth:
             _md_path = os.path.join(
-                os.path.dirname(os.path.dirname(_img_path)),
+                self.parser.data_dir,
                 "mono_depth",
-                os.path.basename(_img_path) + ".npy",
+                self.parser.image_names[index] + ".npy",
             )
             if os.path.exists(_md_path):
                 _md = np.load(_md_path).astype(np.float32)
