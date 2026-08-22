@@ -302,6 +302,15 @@ class Config:
     # Apply the alpha BCE to every valid pixel instead of a sky mask. Only has an
     # effect when --sky_mask_dir is unset.
     sky_bce_everywhere: bool = False
+    # recon360: replace the BCE -log(1-a) with plain a.mean() on sky pixels.
+    # BCE's gradient is 1/(1-a): warm-starting a converged model (sky alpha
+    # 1-eps) hands every gaussian grazing a sky pixel a transiently enormous
+    # gradient and shreds the scene (measured: non-sky held-out 22.9 -> 12.1
+    # after 6k continuation steps). L1's pressure is constant and consistent,
+    # which under Adam is exactly what moves parameters -- fog with no
+    # photometric defence still dies, structure defended by the photometric
+    # term does not get the 1e6-scale kick.
+    sky_alpha_l1: bool = False
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -1424,7 +1433,10 @@ class Runner:
                 a = alphas[..., 0]
                 if masks is not None:
                     a = a[masks]
-                skyloss = -torch.log1p(-a.clamp(max=1.0 - 1e-6)).mean()
+                if cfg.sky_alpha_l1:
+                    skyloss = a.mean()
+                else:
+                    skyloss = -torch.log1p(-a.clamp(max=1.0 - 1e-6)).mean()
                 loss = loss + cfg.sky_alpha_lambda * skyloss
             elif self.sky_module is not None and "sky_mask" in data:
                 # BCE pushing alpha -> 0 where the (eroded) sky mask says sky.
@@ -1436,7 +1448,10 @@ class Runner:
                     skym = skym & masks
                 if skym.any():
                     a = alphas[..., 0][skym].clamp(max=1.0 - 1e-6)
-                    skyloss = -torch.log1p(-a).mean()
+                    if cfg.sky_alpha_l1:
+                        skyloss = a.mean()
+                    else:
+                        skyloss = -torch.log1p(-a).mean()
                     loss = loss + cfg.sky_alpha_lambda * skyloss
             if cfg.depth_loss:
                 # query depths from depth map
