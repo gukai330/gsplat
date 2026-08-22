@@ -316,6 +316,16 @@ class Config:
     flare_gain: bool = False
     flare_knots: int = 12
     flare_lr: float = 3e-3
+    # recon360: geometric alternative to the sky BCE. On sky-mask pixels,
+    # penalise the rendered EXPECTED HIT DISTANCE falling below sky_far_min
+    # (normalized units): sky content may exist, but only far away. Unlike
+    # the BCE it neither kills the sky nor leaves it unsupervised -- the S1
+    # mask-out arm measured that unsupervised sky rays are free real estate
+    # and the fog grows WORSE. Gated on alpha>0.5 so empty sky is legal.
+    # On the fisheye path (global_z_order False) the UT projection depth is
+    # Euclidean distance, which is exactly the right quantity here.
+    sky_far_lambda: float = 0.0
+    sky_far_min: float = 8.5
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -1393,7 +1403,9 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if (cfg.depth_loss or cfg.mono_depth) else "RGB",
+                render_mode="RGB+ED"
+                if (cfg.depth_loss or cfg.mono_depth or cfg.sky_far_lambda > 0)
+                else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
@@ -1475,6 +1487,15 @@ class Runner:
                     else:
                         skyloss = -torch.log1p(-a).mean()
                     loss = loss + cfg.sky_alpha_lambda * skyloss
+            if cfg.sky_far_lambda > 0 and "sky_mask" in data and depths is not None:
+                skym_f = data["sky_mask"].to(device)
+                if masks is not None:
+                    skym_f = skym_f & masks
+                near = skym_f & (alphas[..., 0] > 0.5)
+                if near.any():
+                    d = depths[..., 0][near]
+                    skyfar = torch.relu(1.0 - d / cfg.sky_far_min).mean()
+                    loss = loss + cfg.sky_far_lambda * skyfar
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
