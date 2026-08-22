@@ -1491,6 +1491,15 @@ class Runner:
                 skym_f = data["sky_mask"].to(device)
                 if masks is not None:
                     skym_f = skym_f & masks
+                if mono_depth_gt is not None:
+                    # MoGe's validity mask is a per-pixel second opinion on
+                    # "really sky": it returns geometry for pale poles the
+                    # segmenter swallows (no finite point exists for true sky).
+                    # Without this gate the hinge dims the near mass on
+                    # mislabelled pole pixels -- measured as semi-transparent
+                    # poles in the viewer, the same wound the BCE used to
+                    # inflict through the same mask errors.
+                    skym_f = skym_f & ~torch.isfinite(mono_depth_gt)
                 near = skym_f & (alphas[..., 0] > 0.5)
                 if near.any():
                     d = depths[..., 0][near]
