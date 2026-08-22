@@ -311,6 +311,11 @@ class Config:
     # photometric defence still dies, structure defended by the photometric
     # term does not get the 1e6-scale kick.
     sky_alpha_l1: bool = False
+    # recon360: learn a per-eye radial gain g_e(theta) applied to the rendered
+    # image before the loss (see examples/flare_model.py for why).
+    flare_gain: bool = False
+    flare_knots: int = 12
+    flare_lr: float = 3e-3
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -829,6 +834,19 @@ class Runner:
             print(f"[recon360] sky model on: SH degree {cfg.sky_sh_degree}, "
                   f"masks {cfg.sky_mask_dir or '(none: composite only)'}, "
                   f"alpha lambda {cfg.sky_alpha_lambda}")
+        self.flare_module = None
+        self.flare_optimizers = []
+        if cfg.flare_gain:
+            from flare_model import FlareGain
+
+            self.flare_module = FlareGain(
+                len(self.parser.Ks_dict), cfg.flare_knots).to(self.device)
+            self.flare_optimizers = [
+                torch.optim.Adam(self.flare_module.parameters(), lr=cfg.flare_lr)
+            ]
+            print(f"[recon360] flare gain on: {len(self.parser.Ks_dict)} cams x "
+                  f"{cfg.flare_knots} knots, lr {cfg.flare_lr}")
+
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
         print("Model initialized. Number of GS:", len(self.splats["means"]))
@@ -1395,6 +1413,10 @@ class Runner:
                     data["camera_idx"], Ks, camtoworlds, width, height)
                 colors = colors + sky_rgb * (1.0 - alphas)
 
+            if self.flare_module is not None:
+                colors = colors * self.flare_module.gain_image(
+                    int(data["camera_idx"].reshape(-1)[0]), Ks[0], width, height)
+
             # While Gaussians are frozen for PPISP controller distillation the render
             # output has requires_grad=False, so densification bookkeeping (e.g.
             # DefaultStrategy's retain_grad) is both invalid and unnecessary.
@@ -1753,6 +1775,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.sky_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.flare_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
