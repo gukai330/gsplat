@@ -340,6 +340,9 @@ class Config:
     # Scatter pearson on DA360 disparities: sky arrives as a VALID ~0
     # disparity, so unlike MoGe's NaN the anchor also pushes sky rays far.
     mono_depth_erp: Optional[str] = None
+    # recon360: veiling-glare PSF (see examples/glare_model.py).
+    glare_psf: bool = False
+    glare_lr: float = 1e-2
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -871,6 +874,18 @@ class Runner:
             ]
             print(f"[recon360] flare gain on: {len(self.parser.Ks_dict)} cams x "
                   f"{cfg.flare_knots} knots, lr {cfg.flare_lr}")
+
+        self.glare_module = None
+        self.glare_optimizers = []
+        if cfg.glare_psf:
+            from glare_model import GlarePSF
+
+            self.glare_module = GlarePSF(len(self.parser.Ks_dict)).to(self.device)
+            self.glare_optimizers = [
+                torch.optim.Adam(self.glare_module.parameters(), lr=cfg.glare_lr)
+            ]
+            print(f"[recon360] glare PSF on: {len(self.parser.Ks_dict)} cams, "
+                  f"sigmas {GlarePSF.SIGMAS}, lr {cfg.glare_lr}")
 
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
@@ -1445,6 +1460,10 @@ class Runner:
                 colors = colors * self.flare_module.gain_image(
                     int(data["camera_idx"].reshape(-1)[0]), Ks[0], width, height)
 
+            if self.glare_module is not None:
+                colors = self.glare_module.apply(
+                    int(data["camera_idx"].reshape(-1)[0]), colors)
+
             # While Gaussians are frozen for PPISP controller distillation the render
             # output has requires_grad=False, so densification bookkeeping (e.g.
             # DefaultStrategy's retain_grad) is both invalid and unnecessary.
@@ -1762,6 +1781,9 @@ class Runner:
                             f,
                             indent=1,
                         )
+                if self.glare_module is not None:
+                    torch.save({"logw": self.glare_module.logw.detach().cpu()},
+                               f"{cfg.result_dir}/glare.pt")
                 if self.flare_module is not None:
                     # recon360: the learned per-eye radial gain is an analysis
                     # product in its own right (compare against the variation
@@ -1857,6 +1879,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.flare_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.glare_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
