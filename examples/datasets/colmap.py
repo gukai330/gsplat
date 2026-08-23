@@ -462,6 +462,7 @@ class Dataset:
         load_depths: bool = False,
         load_mono_depth: bool = False,
         sky_mask_dir: Optional[str] = None,
+        mono_depth_erp: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
@@ -472,6 +473,22 @@ class Dataset:
         # keep-mask -- it marks pixels where the trainer's sky background model
         # may push gaussian alpha toward 0 (see simple_trainer's sky_model).
         self.sky_mask_dir = sky_mask_dir
+        # recon360: scatter supervision from an ERP depth model (DA360). The
+        # model's native output samples are projected once per capture into
+        # each eye (scatter_e{0,1}.npz); per frame only the ERP disparity is
+        # loaded (~1 MB) and indexed -- nothing is interpolated, supervision
+        # lands on the model's actual sample positions.
+        self.mono_depth_erp = mono_depth_erp
+        self._erp_scatter = {}
+        if mono_depth_erp is not None:
+            for _eye in ("e0", "e1"):
+                _p = os.path.join(mono_depth_erp, f"scatter_{_eye}.npz")
+                if os.path.exists(_p):
+                    _z = np.load(_p)
+                    self._erp_scatter[_eye] = {
+                        "erp_idx": _z["erp_idx"],
+                        "xy": _z["xy"].astype(np.float32),
+                    }
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -585,6 +602,16 @@ class Dataset:
                 if self.patch_size is not None:
                     _md = _md[y : y + self.patch_size, x : x + self.patch_size]
                 data["mono_depth"] = torch.from_numpy(_md)
+
+        if self.mono_depth_erp is not None:
+            _nm = self.parser.image_names[index]
+            _eye, _base = os.path.split(_nm)
+            _dp = os.path.join(self.mono_depth_erp, "disp", _base + ".npy")
+            if _eye in self._erp_scatter and os.path.exists(_dp):
+                _sc = self._erp_scatter[_eye]
+                _disp = np.load(_dp).astype(np.float32).ravel()
+                data["mono_pts"] = torch.from_numpy(_sc["xy"])
+                data["mono_gt_disp"] = torch.from_numpy(_disp[_sc["erp_idx"]])
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]

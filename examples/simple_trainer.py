@@ -336,6 +336,10 @@ class Config:
     # line, kappa), so K=4 keeps the steering and gives back most of the
     # ED-render and npy-IO overhead. depth_loss (sparse SfM) is unaffected.
     aux_depth_every: int = 1
+    # recon360: dir from scripts/fisheye_erp_depth.py (disp/ + scatter_e*.npz).
+    # Scatter pearson on DA360 disparities: sky arrives as a VALID ~0
+    # disparity, so unlike MoGe's NaN the anchor also pushes sky rays far.
+    mono_depth_erp: Optional[str] = None
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -705,6 +709,7 @@ class Runner:
                 load_depths=cfg.depth_loss,
                 load_mono_depth=cfg.mono_depth,
                 sky_mask_dir=cfg.sky_mask_dir,
+                mono_depth_erp=cfg.mono_depth_erp,
             )
             self.valset = Dataset(self.parser, split="val")
         if cfg.sky_sphere_points > 0:
@@ -1414,7 +1419,8 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if (cfg.depth_loss or (
-                    (cfg.mono_depth or cfg.sky_far_lambda > 0)
+                    (cfg.mono_depth or cfg.sky_far_lambda > 0
+                     or cfg.mono_depth_erp is not None)
                     and step % cfg.aux_depth_every == 0)) else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
@@ -1518,6 +1524,30 @@ class Runner:
                     d = depths[..., 0][near]
                     skyfar = torch.relu(1.0 - d / cfg.sky_far_min).mean()
                     loss = loss + cfg.sky_far_lambda * skyfar
+            if (cfg.mono_depth_erp is not None and depths is not None
+                    and "mono_pts" in data
+                    and (cfg.mono_depth_stop_iter < 0
+                         or step < cfg.mono_depth_stop_iter)):
+                pts = data["mono_pts"].to(device)          # [1, M, 2] pixels
+                gtd = data["mono_gt_disp"].to(device)      # [1, M]
+                grid = torch.stack(
+                    [pts[..., 0] / (width - 1) * 2 - 1,
+                     pts[..., 1] / (height - 1) * 2 - 1], -1)[:, None]
+                pd = torch.nn.functional.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True)[:, 0, 0]
+                pa = torch.nn.functional.grid_sample(
+                    alphas.permute(0, 3, 1, 2), grid, align_corners=True)[:, 0, 0]
+                vm = torch.isfinite(gtd) & (pd > 1e-6) & (pa > 0.5)
+                if vm.sum() >= 512:
+                    pr = 1.0 / pd[vm]
+                    gt = gtd[vm]
+                    pr = pr - pr.mean()
+                    gt = gt - gt.mean()
+                    dn = pr.norm() * gt.norm()
+                    if dn > 0:
+                        loss = loss + cfg.mono_depth_lambda * (
+                            1.0 - (pr * gt).sum() / dn)
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
