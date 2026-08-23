@@ -1762,6 +1762,12 @@ class Runner:
                             f,
                             indent=1,
                         )
+                if self.flare_module is not None:
+                    # recon360: the learned per-eye radial gain is an analysis
+                    # product in its own right (compare against the variation
+                    # probe's measured profiles) -- keep it with the run.
+                    torch.save({"raw": self.flare_module.raw.detach().cpu()},
+                               f"{cfg.result_dir}/flare.pt")
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
