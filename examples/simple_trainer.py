@@ -326,6 +326,16 @@ class Config:
     # Euclidean distance, which is exactly the right quantity here.
     sky_far_lambda: float = 0.0
     sky_far_min: float = 8.5
+    # Apply sky_far only before this step (-1 = whole run). The fog is built
+    # while densification runs; past refine_stop there is nothing left to
+    # steer and the hinge is pure cost.
+    sky_far_stop_iter: int = -1
+    # Render the ED channel and apply the depth auxiliaries (mono_depth,
+    # sky_far) only every K steps. Under Adam what moves parameters is
+    # gradient CONSISTENCY, not per-step magnitude (pitfalls: contraction
+    # line, kappa), so K=4 keeps the steering and gives back most of the
+    # ED-render and npy-IO overhead. depth_loss (sparse SfM) is unaffected.
+    aux_depth_every: int = 1
     # Seed the point cloud with N extra points on a distant sphere, coloured by
     # the sky model in --sky_init. The alternative to a background function: give
     # the sky its own dedicated far gaussians from step 0, so MCMC never has to
@@ -1403,9 +1413,9 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED"
-                if (cfg.depth_loss or cfg.mono_depth or cfg.sky_far_lambda > 0)
-                else "RGB",
+                render_mode="RGB+ED" if (cfg.depth_loss or (
+                    (cfg.mono_depth or cfg.sky_far_lambda > 0)
+                    and step % cfg.aux_depth_every == 0)) else "RGB",
                 masks=masks,
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
@@ -1487,7 +1497,10 @@ class Runner:
                     else:
                         skyloss = -torch.log1p(-a).mean()
                     loss = loss + cfg.sky_alpha_lambda * skyloss
-            if cfg.sky_far_lambda > 0 and "sky_mask" in data and depths is not None:
+            if (cfg.sky_far_lambda > 0 and "sky_mask" in data
+                    and depths is not None
+                    and (cfg.sky_far_stop_iter < 0
+                         or step < cfg.sky_far_stop_iter)):
                 skym_f = data["sky_mask"].to(device)
                 if masks is not None:
                     skym_f = skym_f & masks
