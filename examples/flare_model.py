@@ -34,6 +34,11 @@ class FlareGain(torch.nn.Module):
             i0 = t.floor().long().clamp(max=self.raw.shape[1] - 2)
             self._cache[key] = (i0, t - i0.float())
         i0, w = self._cache[key]
+        # Gauge: pin g(theta=0)=0 so the curve can only express RELATIVE
+        # radial variation. Without this the F1 arm degenerated to a flat
+        # +11% global gain (a dynamic-range buffer for saturated sky, not
+        # flare) and eval-without-the-module read 2 dB dark.
         prof = self.raw[int(cam_idx)]
+        prof = prof - prof[0]
         g = prof[i0] * (1.0 - w) + prof[i0 + 1] * w
         return torch.exp(g)[None, ..., None]        # [1, H, W, 1]
