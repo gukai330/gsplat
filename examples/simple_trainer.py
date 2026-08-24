@@ -325,7 +325,11 @@ class Config:
     # On the fisheye path (global_z_order False) the UT projection depth is
     # Euclidean distance, which is exactly the right quantity here.
     sky_far_lambda: float = 0.0
-    sky_far_min: float = 8.5
+    # Normalized units if positive. NEGATIVE means a multiple of scene_scale
+    # (the camera-cloud radius): -5 is ~50 m on the walked substation captures
+    # (r_c ~ 10 m), and unlike a fixed unit count it does not need the CAD
+    # metric scale, which only exists after stage C.
+    sky_far_min: float = -5.0
     # Apply sky_far only before this step (-1 = whole run). The fog is built
     # while densification runs; past refine_stop there is nothing left to
     # steer and the hinge is pure cost.
@@ -1541,7 +1545,9 @@ class Runner:
                 near = skym_f & (alphas[..., 0] > 0.5)
                 if near.any():
                     d = depths[..., 0][near]
-                    skyfar = torch.relu(1.0 - d / cfg.sky_far_min).mean()
+                    _sfm = (cfg.sky_far_min if cfg.sky_far_min > 0
+                            else -cfg.sky_far_min * self.scene_scale)
+                    skyfar = torch.relu(1.0 - d / _sfm).mean()
                     loss = loss + cfg.sky_far_lambda * skyfar
             if (cfg.mono_depth_erp is not None and depths is not None
                     and "mono_pts" in data
