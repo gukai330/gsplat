@@ -128,6 +128,11 @@ def apply_exposure_prior(colors: Tensor, exposure: Tensor, alpha: Tensor) -> Ten
 class Config:
     # Disable viewer
     disable_viewer: bool = False
+    # recon360: with the viewer enabled the process used to sleep forever after
+    # training so a person could keep looking. A driver that runs the trainer as
+    # one stage of many needs it to return instead; the viewer is a live view of
+    # the training, and pipeline_ui opens it while the stage runs.
+    viewer_exit_on_finish: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # recon360: warm start. `ckpt` above is an EVAL-ONLY path (it loads splats then
@@ -2204,23 +2209,28 @@ class Runner:
             "alpha": "RGB",
         }
 
-        render_colors, render_alphas, info = self.stage.render(
-            self.scene.id,
-            camtoworlds=c2w[None],
-            Ks=K[None],
-            width=width,
-            height=height,
-            sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
-            near_plane=render_tab_state.near_plane,
-            far_plane=render_tab_state.far_plane,
-            radius_clip=render_tab_state.radius_clip,
-            eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
-            / 255.0,
-            render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
-            rasterize_mode=render_tab_state.rasterize_mode,
-            camera_model=render_tab_state.camera_model,
-        )  # [1, H, W, 3]
+        # recon360: render through rasterize_splats, the same path training uses,
+        # so --with_ut / --with_eval3d / --global_z_order apply. A UT-trained
+        # model rendered through the plain projection shows opaque blobs in
+        # front of the camera (CLAUDE.md, Training), and the stage path did not
+        # carry those flags.
+        with torch.no_grad():
+            render_colors, render_alphas, info = self.rasterize_splats(
+                camtoworlds=c2w[None],
+                Ks=K[None],
+                width=width,
+                height=height,
+                sh_degree=min(render_tab_state.max_sh_degree, self.cfg.sh_degree),
+                near_plane=render_tab_state.near_plane,
+                far_plane=render_tab_state.far_plane,
+                radius_clip=render_tab_state.radius_clip,
+                eps2d=render_tab_state.eps2d,
+                backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
+                / 255.0,
+                render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
+                rasterize_mode=render_tab_state.rasterize_mode,
+                camera_model=render_tab_state.camera_model,
+            )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(self.splats["means"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
@@ -2364,6 +2374,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     if not cfg.disable_viewer:
         runner.viewer.complete()
+        if cfg.viewer_exit_on_finish:
+            print("Viewer closing: training finished.", flush=True)
+            try:
+                runner.server.stop()
+            except Exception:  # noqa: BLE001 -- best effort; the process exits anyway
+                pass
+            return
         print("Viewer running... Ctrl+C to exit.")
         time.sleep(1000000)
 
